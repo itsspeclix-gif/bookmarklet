@@ -1,5 +1,4 @@
 (async function _main() {
-javascript:(async function _main() {
     localStorage.setItem('_bookmarkletSrc', _main.toString());
     var sheetId = '1-fLK1EJH9TxtmaA9Cksy66XgK3u6imn1-CksGjQ7WWc';
     var vaultUrl = 'https://docs.google.com/spreadsheets/d/' + sheetId + '/export?format=csv';
