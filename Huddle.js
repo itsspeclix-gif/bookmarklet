@@ -1,5 +1,5 @@
-javascript:(function(){
-  var BASE='https://santa--019d84e3573870fa8b1daeffe1cc2100.web.val.run';
+(function(){
+  var BASE='https://vanessajacobson--019d85000e2e77bd9cf61e2b7b168d01.web.val.run';
   var STORE_KEY='kikko_token';
   var THEME_KEY='kikko_bm_theme';
 
