@@ -1,13 +1,124 @@
 javascript:(() => {
   "use strict";
 
-  const API_URL = "https://eobqcqv0l2849l.m.pipedream.net";
+  /* ========================================================================
+     AI WORKSPACE BOOKMARKLET
+     ------------------------------------------------------------------------
+     Single IIFE injected into any page. Renders a windowed chat client
+     inside a closed shadow root.
+
+     CONTENTS
+       01 Constants & settings          19 Conversation lifecycle
+       02 Error types                   20 Sidebar & chat management
+       03 Generic utilities             21 Shared rendering helpers
+       04 TRANSPORT LAYER  <-- backend  22 Syntax highlighting
+       05 Context budget                23 Rendered-output helpers
+       06 Markdown rendering            24 SmoothWriter
+       07 Test hook (early return)      25 Scrolling & context marker
+       08 Host element & shadow root    26 User-turn rendering
+       09 UI icons                      27 Assistant-turn rendering
+       10 Stylesheet & markup           28 Thread rendering & branches
+       11 DOM references                29 Model & thinking selection
+       12 Local storage                 30 Composer state
+       13 Window geometry & viewport    31 Generation run loop
+       14 Dragging & resizing           32 Find in chat
+       15 Toasts                        33 Command palette
+       16 Popover menus                 34 Controls & event listeners
+       17 Conversation graph            35 Lifecycle & initialization
+       18 Persistence & pruning
+
+     Sections 01-07 run in every context. Section 07 returns early when a
+     test hook is present, so nothing below it executes under test.
+     ======================================================================== */
+
+  /* ========================================================================
+     01. CONSTANTS & SETTINGS
+     ======================================================================== */
+
+  const RESULTS_SHEET_ID = "1CHEqG5l9FyJJ1K3fpzaBrs51m5c5ujFySt2haPI6ITQ";
+  const RESULTS_SHEET_NAME = "Results";
+
+  // Google Forms request ingress. Numeric entry.* field names are bound to
+  // the live form and POST to its formResponse endpoint.
+  const GOOGLE_FORM = Object.freeze({
+    responseUrl: "https://docs.google.com/forms/d/e/1FAIpQLSfWtpdVUIXje-u_sf5r4BtO-0Ehv6Reqrjek2mfzvrGP6QKyQ/formResponse",
+    entries: Object.freeze({
+      conversationId: "entry.1081201375",
+      userNodeId: "entry.1256401687",
+      parentNodeId: "entry.1340705324",
+      assistantNodeId: "entry.2110568355",
+      requestId: "entry.207635500",
+      model: "entry.1927622093",
+      thinking: "entry.862519757",
+      message: "entry.319149887"
+    })
+  });
+
+  // Compatibility alias retained for the existing test hook.
+  const API_URL = GOOGLE_FORM.responseUrl;
+
   const SETTINGS = Object.freeze({
     maxNetworkRetries: 1,
     stallTimeoutMs: 180000,
+    resultPollIntervalMs: 900,
+    resultPollTimeoutMs: 180000,
+    maxMailboxReadErrors: 3,
     maxHistoryChars: 160000,
     maxRenderedTurns: 140
   });
+
+  // Model metadata no longer depends on a direct browser -> proxy GET.
+  // The provider/model IDs match the deployed Cloudflare Worker contract.
+  const STATIC_SERVER_CONFIG = Object.freeze({
+    version: 2,
+    defaultModel: "gemma4",
+    models: [
+      {
+        id: "gemma4",
+        label: "Gemma 4 26B",
+        provider: "Google",
+        defaultThinking: "minimal",
+        thinking: [
+          { id: "minimal", label: "Minimal", description: "Minimal reasoning", returnsThoughts: true },
+          { id: "high", label: "High", description: "Extended reasoning", returnsThoughts: true }
+        ]
+      },
+      {
+        id: "qwen36",
+        label: "Qwen 3.6 27B",
+        provider: "Groq",
+        defaultThinking: "none",
+        thinking: [
+          { id: "none", label: "None", description: "Reasoning disabled", returnsThoughts: false },
+          { id: "default", label: "Default", description: "Reasoning enabled", returnsThoughts: true }
+        ]
+      },
+      {
+        id: "mistralSmall4",
+        label: "Mistral Small 4",
+        provider: "Mistral",
+        defaultThinking: "none",
+        thinking: [
+          { id: "none", label: "None", description: "Reasoning disabled", returnsThoughts: false },
+          { id: "high", label: "High", description: "Extended reasoning", returnsThoughts: true }
+        ]
+      },
+      {
+        id: "mistralMedium35",
+        label: "Mistral Medium 3.5",
+        provider: "Mistral",
+        defaultThinking: "none",
+        thinking: [
+          { id: "none", label: "None", description: "Reasoning disabled", returnsThoughts: false },
+          { id: "high", label: "High", description: "Extended reasoning", returnsThoughts: true }
+        ]
+      }
+    ]
+  });
+
+  /* ========================================================================
+     02. ERROR TYPES
+     ======================================================================== */
 
   class HttpError extends Error {
     constructor(status, statusText, body, retryAfterMs = 0) {
@@ -43,6 +154,10 @@ javascript:(() => {
     }
   }
 
+  /* ========================================================================
+     03. GENERIC UTILITIES
+     ======================================================================== */
+
   const makeAbortError = () => new DOMException("The operation was aborted.", "AbortError");
 
   const delay = (milliseconds, signal) => new Promise((resolve, reject) => {
@@ -60,6 +175,23 @@ javascript:(() => {
     }, milliseconds);
     signal?.addEventListener("abort", onAbort, { once: true });
   });
+
+  /* ========================================================================
+     04. TRANSPORT LAYER   ***  GOOGLE RELAY BACKEND BOUNDARY  ***
+     ------------------------------------------------------------------------
+     Browser request path:
+       hidden/no-CORS Google Form submission
+         -> AppSheet
+         -> Cloudflare Worker + D1 + AI provider
+         -> AppSheet
+         -> Google Sheets Results mailbox
+         -> bookmarklet polling by requestId
+
+     The browser never calls Cloudflare or an AI provider directly.
+     D1 is the provider-context authority for graph-aware requests.
+     ======================================================================== */
+
+  /* ---- generic response helpers ----------------------------------------- */
 
   function parseResponseBody(text) {
     if (!text) return "";
@@ -106,27 +238,20 @@ javascript:(() => {
     throw new HttpError(status, payload.error.status || "", payload, retryAfterMsFromBody(payload));
   }
 
+  /* ---- model configuration ---------------------------------------------- */
+
   function parseServerConfig(payload) {
     if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-      throw new StreamInterruptedError("The Pipedream proxy returned an invalid configuration object.");
-    }
-
-    if (payload.error) {
-      throw new HttpError(
-        Number(payload.error.code) || 500,
-        payload.error.status || "",
-        payload,
-        retryAfterMsFromBody(payload)
-      );
+      throw new StreamInterruptedError("The model configuration is invalid.");
     }
 
     if (!Array.isArray(payload.models) || !payload.models.length) {
-      throw new StreamInterruptedError("The Pipedream proxy returned no model configuration.");
+      throw new StreamInterruptedError("No model configuration is available.");
     }
 
     const models = payload.models.map(model => {
       if (!model || typeof model !== "object" || typeof model.id !== "string" || typeof model.label !== "string") {
-        throw new StreamInterruptedError("The Pipedream proxy returned an invalid model configuration.");
+        throw new StreamInterruptedError("The model configuration is invalid.");
       }
       const thinking = Array.isArray(model.thinking)
         ? model.thinking.filter(option => option && typeof option.id === "string" && typeof option.label === "string")
@@ -149,7 +274,7 @@ javascript:(() => {
     });
 
     if (typeof payload.defaultModel !== "string" || !models.some(model => model.id === payload.defaultModel)) {
-      throw new StreamInterruptedError("The Pipedream proxy returned an invalid default model.");
+      throw new StreamInterruptedError("The default model is unavailable.");
     }
 
     return {
@@ -159,18 +284,261 @@ javascript:(() => {
     };
   }
 
-  function extractProxyPayload(payload) {
-    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
-      throw new StreamInterruptedError("The Pipedream proxy returned an invalid response object.");
+  async function fetchServerConfig() {
+    // Deliberately local: loading the UI must not require a direct network call.
+    return parseServerConfig(STATIC_SERVER_CONFIG);
+  }
+
+  /* ---- transport setup validation --------------------------------------- */
+
+  function transportConfigured() {
+    if (!GOOGLE_FORM.responseUrl || GOOGLE_FORM.responseUrl.startsWith("__")) return false;
+    return Object.values(GOOGLE_FORM.entries).every(value => typeof value === "string" && /^entry\.\d+$/.test(value));
+  }
+
+  function assertTransportConfigured() {
+    if (transportConfigured()) return;
+    throw new StreamInterruptedError(
+      "Google Form transport is not configured yet. Fill the response URL and entry.* IDs in section 01."
+    );
+  }
+
+  /* ---- Google Form request submission ----------------------------------- */
+
+  function buildGoogleFormBody(request) {
+    const body = new URLSearchParams();
+    const fields = [
+      ["conversationId", request.conversationId],
+      ["userNodeId", request.userNodeId],
+      ["parentNodeId", request.parentNodeId || ""],
+      ["assistantNodeId", request.assistantNodeId],
+      ["requestId", request.requestId],
+      ["model", request.model],
+      ["thinking", request.thinking],
+      ["message", request.message]
+    ];
+    for (const [key, value] of fields) body.set(GOOGLE_FORM.entries[key], String(value ?? ""));
+    return body;
+  }
+
+  function hiddenFormSubmit(body) {
+    return new Promise((resolve, reject) => {
+      const token = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+      const frameName = `__ai_form_sink_${token}`;
+      const iframe = document.createElement("iframe");
+      iframe.name = frameName;
+      iframe.hidden = true;
+      iframe.setAttribute("aria-hidden", "true");
+
+      const form = document.createElement("form");
+      form.method = "POST";
+      form.action = GOOGLE_FORM.responseUrl;
+      form.target = frameName;
+      form.acceptCharset = "UTF-8";
+      form.hidden = true;
+
+      for (const [name, value] of body.entries()) {
+        const input = document.createElement("input");
+        input.type = "hidden";
+        input.name = name;
+        input.value = value;
+        form.appendChild(input);
+      }
+
+      const cleanup = () => {
+        setTimeout(() => {
+          form.remove();
+          iframe.remove();
+        }, 30000);
+      };
+
+      try {
+        document.documentElement.append(iframe, form);
+        form.submit();
+        cleanup();
+        // Cross-origin iframe responses cannot be inspected. Submission is
+        // confirmed indirectly by the Results mailbox poll that follows.
+        setTimeout(resolve, 80);
+      } catch (error) {
+        form.remove();
+        iframe.remove();
+        reject(error);
+      }
+    });
+  }
+
+  async function submitGoogleForm(request, signal, fetchImplementation = globalThis.fetch) {
+    assertTransportConfigured();
+    if (signal?.aborted) throw makeAbortError();
+    const body = buildGoogleFormBody(request);
+
+    try {
+      await fetchImplementation(GOOGLE_FORM.responseUrl, {
+        method: "POST",
+        mode: "no-cors",
+        headers: { "Content-Type": "application/x-www-form-urlencoded;charset=UTF-8" },
+        body: body.toString(),
+        signal,
+        cache: "no-store",
+        credentials: "include",
+        referrerPolicy: "no-referrer"
+      });
+      return;
+    } catch (error) {
+      if (signal?.aborted) throw makeAbortError();
+      // Some host pages block cross-origin fetch via connect-src. A normal
+      // hidden form navigation can still work, so fall back to it.
+      await hiddenFormSubmit(body);
+    }
+  }
+
+  /* ---- Google Sheets Results mailbox ------------------------------------ */
+
+  function gvizValue(cell) {
+    if (!cell) return "";
+    if (cell.v === null || cell.v === undefined) return "";
+    return cell.v;
+  }
+
+  function parseGvizText(text) {
+    const source = String(text || "");
+    const first = source.indexOf("{");
+    const last = source.lastIndexOf("}");
+    if (first < 0 || last <= first) throw new StreamInterruptedError("Google Sheets returned an unreadable result payload.");
+    try {
+      return JSON.parse(source.slice(first, last + 1));
+    } catch {
+      throw new StreamInterruptedError("Google Sheets returned malformed result data.");
+    }
+  }
+
+  function resultRowsFromGviz(payload) {
+    if (payload?.status && String(payload.status).toLowerCase() !== "ok") {
+      const details = Array.isArray(payload.errors)
+        ? payload.errors
+            .map(error => error?.detailed_message || error?.message || error?.reason || "")
+            .filter(Boolean)
+            .join(" | ")
+        : "";
+      throw new StreamInterruptedError(
+        details ? `Google Sheets mailbox query failed: ${details}` : "Google Sheets mailbox query failed."
+      );
     }
 
-    if (payload.error) {
-      throw new HttpError(
-        Number(payload.error.code) || 500,
-        payload.error.status || "",
-        payload,
-        retryAfterMsFromBody(payload)
-      );
+    const rows = Array.isArray(payload?.table?.rows) ? payload.table.rows : [];
+    return rows.map(row => {
+      const cells = Array.isArray(row?.c) ? row.c : [];
+      const get = index => gvizValue(cells[index]);
+      return {
+        requestId: String(get(0) || ""),
+        status: String(get(1) || ""),
+        modelId: String(get(2) || ""),
+        modelLabel: String(get(3) || ""),
+        provider: String(get(4) || ""),
+        thinking: String(get(5) || ""),
+        thought: String(get(6) || ""),
+        answer: String(get(7) || ""),
+        finishReason: String(get(8) || ""),
+        finishMessage: String(get(9) || ""),
+        continuations: Number(get(10)) || 0,
+        outputTokens: Number(get(11)) || 0,
+        reasoningTokens: Number(get(12)) || 0,
+        workerMs: Number(get(13)) || 0,
+        providerMs: Number(get(14)) || 0,
+        providerStatus: Number(get(15)) || 0,
+        errorCode: String(get(16) || ""),
+        errorMessage: String(get(17) || ""),
+        conversationId: String(get(18) || ""),
+        userNodeId: String(get(19) || ""),
+        assistantNodeId: String(get(20) || "")
+      };
+    });
+  }
+
+  function gvizBaseUrl(query, tqx) {
+    const params = new URLSearchParams({
+      sheet: RESULTS_SHEET_NAME,
+      tq: query,
+      tqx,
+      _: String(Date.now())
+    });
+    return `https://docs.google.com/spreadsheets/d/${RESULTS_SHEET_ID}/gviz/tq?${params}`;
+  }
+
+  function requestResultQuery(requestId) {
+    const safeId = String(requestId).replace(/'/g, "''");
+    return `select B,E,G,H,I,J,K,L,M,N,O,P,Q,R,S,T,U,V,W,X,Y where B = '${safeId}' order by D desc limit 5`;
+  }
+
+  async function fetchGvizWithFetch(query, signal, fetchImplementation = globalThis.fetch) {
+    const response = await fetchImplementation(gvizBaseUrl(query, "out:json"), {
+      method: "GET",
+      signal,
+      cache: "no-store",
+      credentials: "include",
+      referrerPolicy: "no-referrer"
+    });
+    if (!response.ok) throw new HttpError(response.status, response.statusText, await response.text());
+    return parseGvizText(await response.text());
+  }
+
+  function fetchGvizWithJsonp(query, signal) {
+    return new Promise((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(makeAbortError());
+        return;
+      }
+
+      const callbackName = `__ai_gviz_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+      const script = document.createElement("script");
+      let settled = false;
+      const timer = setTimeout(() => finish(new StreamInterruptedError("Google Sheets result lookup timed out.")), 12000);
+
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", onAbort);
+        script.remove();
+        try { delete globalThis[callbackName]; } catch { globalThis[callbackName] = undefined; }
+      };
+
+      const finish = (error, value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        if (error) reject(error);
+        else resolve(value);
+      };
+
+      const onAbort = () => finish(makeAbortError());
+      signal?.addEventListener("abort", onAbort, { once: true });
+
+      globalThis[callbackName] = payload => finish(null, payload);
+      script.onerror = () => finish(new StreamInterruptedError("This page blocked the Google Sheets result endpoint."));
+      script.src = gvizBaseUrl(query, `out:json;responseHandler:${callbackName}`);
+      document.documentElement.appendChild(script);
+    });
+  }
+
+  async function fetchResultRows(requestId, signal, fetchImplementation = globalThis.fetch) {
+    const query = requestResultQuery(requestId);
+    try {
+      return resultRowsFromGviz(await fetchGvizWithFetch(query, signal, fetchImplementation));
+    } catch (fetchError) {
+      if (signal?.aborted) throw makeAbortError();
+      try {
+        return resultRowsFromGviz(await fetchGvizWithJsonp(query, signal));
+      } catch (jsonpError) {
+        if (jsonpError?.name === "AbortError") throw jsonpError;
+        throw new StreamInterruptedError(
+          `Could not read the Google Sheets Results mailbox. ${jsonpError?.message || fetchError?.message || ""}`.trim()
+        );
+      }
+    }
+  }
+
+  function extractProxyPayload(payload) {
+    if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+      throw new StreamInterruptedError("The Results mailbox returned an invalid response object.");
     }
 
     const model = payload.model && typeof payload.model === "object"
@@ -179,9 +547,17 @@ javascript:(() => {
           label: typeof payload.model.label === "string" ? payload.model.label : "",
           provider: typeof payload.model.provider === "string" ? payload.model.provider : ""
         }
-      : { id: "", label: "", provider: "" };
+      : {
+          id: typeof payload.modelId === "string" ? payload.modelId : "",
+          label: typeof payload.modelLabel === "string" ? payload.modelLabel : "",
+          provider: typeof payload.provider === "string" ? payload.provider : ""
+        };
 
     return {
+      requestId: typeof payload.requestId === "string" ? payload.requestId : "",
+      conversationId: typeof payload.conversationId === "string" ? payload.conversationId : "",
+      userNodeId: typeof payload.userNodeId === "string" ? payload.userNodeId : "",
+      assistantNodeId: typeof payload.assistantNodeId === "string" ? payload.assistantNodeId : "",
       model,
       thinking: typeof payload.thinking === "string" ? payload.thinking : "",
       thought: typeof payload.thought === "string" ? payload.thought : "",
@@ -189,11 +565,89 @@ javascript:(() => {
       finishReason: typeof payload.finishReason === "string" ? payload.finishReason : "",
       finishMessage: typeof payload.finishMessage === "string" ? payload.finishMessage : "",
       continuations: Number(payload.continuations) || 0,
-      outputTokens: Number(payload.usage?.outputTokens) || 0,
-      reasoningTokens: Number(payload.usage?.reasoningTokens) || 0,
+      outputTokens: Number(payload.outputTokens ?? payload.usage?.outputTokens) || 0,
+      reasoningTokens: Number(payload.reasoningTokens ?? payload.usage?.reasoningTokens) || 0,
       state: payload.state && typeof payload.state === "object" && !Array.isArray(payload.state) ? payload.state : null
     };
   }
+
+  async function pollForResult(requestId, signal, fetchImplementation = globalThis.fetch, timeoutMs = SETTINGS.resultPollTimeoutMs) {
+    const startedAt = Date.now();
+    let lastLookupError = null;
+    let consecutiveLookupErrors = 0;
+
+    while (Date.now() - startedAt < timeoutMs) {
+      if (signal?.aborted) throw makeAbortError();
+      try {
+        const rows = await fetchResultRows(requestId, signal, fetchImplementation);
+        consecutiveLookupErrors = 0;
+        const success = rows.find(row => row.status.toLowerCase() === "ok");
+        if (success) return extractProxyPayload(success);
+
+        const terminalError = rows.find(row => {
+          if (row.status.toLowerCase() !== "error") return false;
+          return row.errorCode !== "REQUEST_ALREADY_PROCESSING";
+        });
+        if (terminalError) {
+          throw new GenerationStoppedError(
+            terminalError.errorCode || terminalError.finishReason || "REQUEST_FAILED",
+            terminalError.errorMessage || terminalError.finishMessage || "The AI request failed."
+          );
+        }
+      } catch (error) {
+        if (error?.name === "AbortError" || error instanceof GenerationStoppedError) throw error;
+        lastLookupError = error;
+        consecutiveLookupErrors += 1;
+        if (consecutiveLookupErrors >= SETTINGS.maxMailboxReadErrors) throw error;
+      }
+
+      await delay(SETTINGS.resultPollIntervalMs, signal);
+    }
+
+    if (lastLookupError) throw lastLookupError;
+    throw new StallTimeoutError(timeoutMs);
+  }
+
+  /* ---- public transport entry point ------------------------------------- */
+
+  async function openProxyRequest(request, signal, fetchImplementation = globalThis.fetch, stallTimeoutMs = SETTINGS.stallTimeoutMs) {
+    if (signal?.aborted) throw makeAbortError();
+    assertTransportConfigured();
+
+    const required = ["requestId", "conversationId", "userNodeId", "assistantNodeId", "model", "thinking", "message"];
+    for (const key of required) {
+      if (typeof request?.[key] !== "string" || !request[key]) {
+        throw new StreamInterruptedError(`Missing transport field: ${key}`);
+      }
+    }
+
+    await submitGoogleForm(request, signal, fetchImplementation);
+    return pollForResult(request.requestId, signal, fetchImplementation, Math.min(stallTimeoutMs, SETTINGS.resultPollTimeoutMs));
+  }
+
+  /* ---- retry policy ------------------------------------------------------ */
+
+  function isRetryableError(error) {
+    if (error?.name === "AbortError") return false;
+    if (error instanceof GenerationStoppedError) return false;
+    if (error instanceof StreamInterruptedError || error instanceof TypeError) return true;
+    return error instanceof HttpError && [408, 409, 425, 429, 500, 502, 503, 504].includes(error.status);
+  }
+
+  function retryDelayMs(error, retryNumber) {
+    const backoff = Math.min(900 * 2 ** Math.max(0, retryNumber - 1), 7200);
+    return Math.max(backoff, Number(error?.retryAfterMs) || 0);
+  }
+
+  /* ========================================================================
+     END OF TRANSPORT LAYER
+     ------------------------------------------------------------------------
+     Nothing below talks directly to Cloudflare or an AI provider.
+     ======================================================================== */
+
+  /* ========================================================================
+     05. CONTEXT BUDGET
+     ======================================================================== */
 
   function historyItemSize(item) {
     let size = typeof item?.text === "string" ? item.text.length : 0;
@@ -219,97 +673,9 @@ javascript:(() => {
     return { items: kept, removed };
   }
 
-  async function fetchServerConfig(fetchImplementation = globalThis.fetch) {
-    const response = await fetchImplementation(API_URL, {
-      method: "GET",
-      cache: "no-store",
-      credentials: "omit",
-      referrerPolicy: "no-referrer"
-    });
-    const text = await response.text();
-    const body = parseResponseBody(text);
-    if (!response.ok) {
-      const retryAfterMs = Math.max(
-        parseDurationMs(response.headers.get("Retry-After")),
-        retryAfterMsFromBody(body)
-      );
-      throw new HttpError(response.status, response.statusText, body, retryAfterMs);
-    }
-    return parseServerConfig(body);
-  }
-
-  async function openProxyRequest(history, message, modelId, thinkingEffort, signal, fetchImplementation = globalThis.fetch, stallTimeoutMs = SETTINGS.stallTimeoutMs) {
-    if (signal?.aborted) throw makeAbortError();
-
-    const attemptController = new AbortController();
-    let stallTimer = 0;
-    let stalled = false;
-
-    const onParentAbort = () => attemptController.abort();
-    const touch = () => {
-      clearTimeout(stallTimer);
-      stallTimer = setTimeout(() => {
-        stalled = true;
-        attemptController.abort();
-      }, stallTimeoutMs);
-    };
-
-    signal?.addEventListener("abort", onParentAbort, { once: true });
-    touch();
-
-    try {
-      const response = await fetchImplementation(API_URL, {
-        method: "POST",
-        headers: {
-          "Content-Type": "text/plain;charset=UTF-8"
-        },
-        body: JSON.stringify({
-          history,
-          message,
-          model: modelId,
-          thinking: thinkingEffort
-        }),
-        signal: attemptController.signal,
-        cache: "no-store",
-        credentials: "omit",
-        referrerPolicy: "no-referrer"
-      });
-
-      touch();
-      const text = await response.text();
-      touch();
-      const body = parseResponseBody(text);
-
-      if (!response.ok) {
-        const retryAfterMs = Math.max(
-          parseDurationMs(response.headers.get("Retry-After")),
-          retryAfterMsFromBody(body)
-        );
-        throw new HttpError(response.status, response.statusText, body, retryAfterMs);
-      }
-
-      return extractProxyPayload(body);
-    } catch (error) {
-      if (signal?.aborted) throw makeAbortError();
-      if (stalled) throw new StallTimeoutError(stallTimeoutMs);
-      throw error;
-    } finally {
-      clearTimeout(stallTimer);
-      signal?.removeEventListener("abort", onParentAbort);
-    }
-  }
-
-  function isRetryableError(error) {
-    if (error?.name === "AbortError") return false;
-    if (error instanceof StreamInterruptedError || error instanceof TypeError) return true;
-    return error instanceof HttpError && [408, 409, 425, 429, 500, 502, 503, 504].includes(error.status);
-  }
-
-  function retryDelayMs(error, retryNumber) {
-    const backoff = Math.min(900 * 2 ** Math.max(0, retryNumber - 1), 7200);
-    return Math.max(backoff, Number(error?.retryAfterMs) || 0);
-  }
-
+  /* ========================================================================
+     06. MARKDOWN RENDERING
+     ======================================================================== */
 
   function escapeHtml(value) {
     return String(value).replace(/[&<>"']/g, character => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "\"": "&quot;", "'": "&#39;" })[character]);
@@ -455,10 +821,21 @@ javascript:(() => {
     return html.join("");
   }
 
+  /* ========================================================================
+     07. TEST HOOK
+     ------------------------------------------------------------------------
+     Present only when a harness sets __GEMMA_BOOKMARKLET_TEST_HOOK__.
+     Returns early, so no UI is constructed under test.
+     ======================================================================== */
+
   const testHook = globalThis.__GEMMA_BOOKMARKLET_TEST_HOOK__;
   if (testHook && typeof testHook === "object") {
     Object.assign(testHook, {
       API_URL,
+      GOOGLE_FORM,
+      RESULTS_SHEET_ID,
+      RESULTS_SHEET_NAME,
+      STATIC_SERVER_CONFIG,
       SETTINGS,
       HttpError,
       StreamInterruptedError,
@@ -472,12 +849,20 @@ javascript:(() => {
       trimHistory,
       fetchServerConfig,
       openProxyRequest,
+      buildGoogleFormBody,
+      transportConfigured,
+      requestResultQuery,
+      resultRowsFromGviz,
       isRetryableError,
       retryDelayMs,
       renderMarkdown
     });
     return;
   }
+
+  /* ========================================================================
+     08. HOST ELEMENT & SHADOW ROOT
+     ======================================================================== */
 
   const HOST_ID = "__gemma_chat_bookmarklet_host__";
   const STORE_NS = "__ai_workspace_v1";
@@ -497,6 +882,10 @@ javascript:(() => {
   host.style.cssText = "all:initial;position:fixed;inset:0;z-index:2147483647;display:block;pointer-events:none;contain:layout style;";
   document.documentElement.appendChild(host);
   const root = host.attachShadow({ mode: globalThis.__GEMMA_BOOKMARKLET_BROWSER_TEST__ ? "open" : "closed" });
+
+  /* ========================================================================
+     09. UI ICONS
+     ======================================================================== */
 
   const ICONS = {
     spark: '<svg viewBox="0 0 16 16" fill="none" aria-hidden="true"><path d="M8 1.6 9.5 6l4.4 1.5L9.5 9 8 13.4 6.5 9 2.1 7.5 6.5 6 8 1.6Z" fill="currentColor"/></svg>',
@@ -523,6 +912,14 @@ javascript:(() => {
     lightZoomIn: '<svg class="zoomin" viewBox="0 0 12 12" aria-hidden="true"><path d="M3.35 3.35h3.05L3.35 6.4z" fill="currentColor" stroke="currentColor" stroke-width=".75" stroke-linejoin="round"/><path d="M8.65 8.65h-3.05L8.65 5.6z" fill="currentColor" stroke="currentColor" stroke-width=".75" stroke-linejoin="round"/></svg>',
     lightZoomOut: '<svg class="zoomout" viewBox="0 0 12 12" aria-hidden="true"><path d="M5.35 5.35h-3.05L5.35 2.3z" fill="currentColor" stroke="currentColor" stroke-width=".75" stroke-linejoin="round"/><path d="M6.65 6.65h3.05L6.65 9.7z" fill="currentColor" stroke="currentColor" stroke-width=".75" stroke-linejoin="round"/></svg>'
   };
+
+  /* ========================================================================
+     10. STYLESHEET & MARKUP TEMPLATE
+     ------------------------------------------------------------------------
+     One template literal: <style> block first, then the markup for the
+     window, sidebar, thread, composer, dock, toasts, menu, find bar and
+     command palette.
+     ======================================================================== */
 
   root.innerHTML = `<style>
 :host{all:initial;color-scheme:dark}
@@ -662,6 +1059,14 @@ svg{display:block;width:100%;height:100%}
 .thread{flex:1;min-height:0;overflow-y:auto;overscroll-behavior:contain;scroll-behavior:smooth;padding:26px 22px 4px;scrollbar-gutter:stable}
 .threadinner{width:min(760px,100%);margin:0 auto}
 .notice{margin:0 0 22px;padding:9px 11px;border:1px dashed var(--line-2);border-radius:10px;color:var(--ink-3);font-size:10.5px;text-align:center}
+.ctxmark{display:flex;align-items:center;gap:12px;margin:2px 0 26px;user-select:none;animation:softUp .25s var(--ease) both}
+.ctxrule{flex:1;height:1px;background:var(--line-2)}
+.ctxbody{flex:none;display:flex;align-items:baseline;gap:8px;min-width:0}
+.ctxtag{flex:none;font-size:9px;letter-spacing:.09em;text-transform:uppercase;font-weight:700;color:var(--accent-2);white-space:nowrap}
+.ctxnote{min-width:0;font-size:10.5px;color:var(--ink-3);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.turn.outside{filter:opacity(.45);transition:filter .2s var(--ease)}
+.turn.outside:hover,.turn.outside:focus-within{filter:none}
+.root.compact .ctxnote{display:none}
 
 /* empty state */
 .empty{position:absolute;inset:0;display:grid;place-items:center;padding:22px 22px 124px;pointer-events:none;transition:opacity .26s var(--ease),transform .26s var(--ease)}
@@ -887,6 +1292,29 @@ mark.hit.on{background:var(--accent);color:#0f1118}
 .root.compact .findbar{left:12px;right:12px;top:8px}
 .root.compact .findinput{width:100%;flex:1;min-width:0}
 
+/* temperature popover */
+.temppanel{display:flex;flex-direction:column;gap:10px;min-width:212px;padding:3px 9px 8px}
+.tempseg{display:flex;gap:4px;padding:3px;border:1px solid var(--line);border-radius:9px;background:rgba(255,255,255,.04)}
+.tempmode{flex:1;height:26px;border-radius:7px;color:var(--ink-2);font-size:11.5px;font-weight:620;transition:background .14s,color .14s,box-shadow .14s}
+.tempmode:hover{color:var(--ink)}
+.tempmode.on{background:var(--accent-soft);color:var(--ink);box-shadow:inset 0 0 0 1px rgba(139,125,255,.34)}
+.temprow{display:flex;align-items:center;gap:9px}
+.templimit{flex:none;font-size:9.5px;color:var(--ink-3);font-variant-numeric:tabular-nums}
+.tempslider{flex:1;min-width:0;height:18px;padding:0;background:transparent;cursor:pointer;appearance:none;-webkit-appearance:none}
+.tempslider::-webkit-slider-runnable-track{height:4px;border-radius:3px;background:rgba(255,255,255,.13)}
+.tempslider::-moz-range-track{height:4px;border-radius:3px;background:rgba(255,255,255,.13)}
+.tempslider::-webkit-slider-thumb{-webkit-appearance:none;width:13px;height:13px;margin-top:-4.5px;border:0;border-radius:50%;background:var(--accent-2);box-shadow:0 0 0 3px rgba(139,125,255,.18)}
+.tempslider::-moz-range-thumb{width:13px;height:13px;border:0;border-radius:50%;background:var(--accent-2);box-shadow:0 0 0 3px rgba(139,125,255,.18)}
+.tempslider:disabled{cursor:default}
+.tempslider:disabled::-webkit-slider-thumb{background:var(--ink-3);box-shadow:none}
+.tempslider:disabled::-moz-range-thumb{background:var(--ink-3);box-shadow:none}
+.tempfoot{display:flex;align-items:center;gap:9px}
+.tempnum{flex:none;width:64px;height:28px;padding:0 8px;border:1px solid var(--line-2);border-radius:8px;background:#0f1118;color:var(--ink);font:12px/1 var(--mono);text-align:center;outline:0;font-variant-numeric:tabular-nums}
+.tempnum:focus{border-color:rgba(139,125,255,.45);box-shadow:0 0 0 3px rgba(139,125,255,.1)}
+.tempnum:disabled{background:rgba(255,255,255,.03);color:var(--ink-3)}
+.temphint{flex:1;min-width:0;font-size:10.5px;line-height:1.4;color:var(--ink-3)}
+.temppanel.auto .temprow,.temppanel.auto .tempnum{opacity:.5}
+
 /* command palette */
 .palette{position:absolute;inset:0;z-index:30;display:flex;justify-content:center;align-items:flex-start;padding:76px 20px 20px;background:rgba(5,6,9,.52);backdrop-filter:blur(3px);-webkit-backdrop-filter:blur(3px)}
 .palette[hidden]{display:none}
@@ -984,6 +1412,7 @@ mark.hit.on{background:var(--accent);color:#0f1118}
         <div class="controls" id="controls">
           <button class="pill" id="modelBtn" type="button" aria-haspopup="menu" aria-expanded="false" disabled><span class="cap">Model</span><span class="val" id="modelVal">Loading</span><span class="chev">${ICONS.chev}</span></button>
           <button class="pill" id="effortBtn" type="button" aria-haspopup="menu" aria-expanded="false" disabled><span class="cap">Think</span><span class="val" id="effortVal">Loading</span><span class="chev">${ICONS.chev}</span></button>
+          <button class="pill" id="tempBtn" type="button" aria-haspopup="menu" aria-expanded="false" disabled><span class="cap">Temp</span><span class="val" id="tempVal">Auto</span><span class="chev">${ICONS.chev}</span></button>
         </div>
         <button class="iconbtn mobileclose" id="btnCloseMobile" type="button" aria-label="Close">${ICONS.close}</button>
       </div>
@@ -1016,7 +1445,7 @@ mark.hit.on{background:var(--accent);color:#0f1118}
           <div class="emptyinner">
             <div class="eyebrow" id="emptyEyebrow">Private workspace</div>
             <div class="emptytitle">Ask anything.<br><span>Get an answer.</span></div>
-            <div class="emptynote" id="emptyNote">Conversations are kept on this device only. Nothing on the page behind is read or sent.</div>
+            <div class="emptynote" id="emptyNote">Chats are saved on this device. Messages you send are relayed to the selected AI model; the page behind is not read or sent.</div>
             <div class="chips" id="chips"></div>
           </div>
         </div>
@@ -1050,6 +1479,10 @@ mark.hit.on{background:var(--accent);color:#0f1118}
   </section>
   <button class="dock" id="dock" type="button" hidden><span class="mark" aria-hidden="true">${ICONS.spark}</span><span class="docktitle" id="dockTitle">New chat</span><span class="dot" id="dockDot"></span></button>
 </div>`;
+
+  /* ========================================================================
+     11. DOM REFERENCES
+     ======================================================================== */
 
   const $ = selector => root.querySelector(selector);
   const rootEl = $(".root");
@@ -1085,13 +1518,17 @@ mark.hit.on{background:var(--accent);color:#0f1118}
   const modelVal = $("#modelVal");
   const effortBtn = $("#effortBtn");
   const effortVal = $("#effortVal");
+  const tempBtn = $("#tempBtn");
+  const tempVal = $("#tempVal");
   const railToggle = $("#btnRail");
   const controlsEl = $("#controls");
   const titleActions = root.querySelector(".titleactions");
   const composerFoot = root.querySelector(".composerfoot");
   const mobileClose = $("#btnCloseMobile");
 
-  /* ---------- device storage ---------- */
+  /* ========================================================================
+     12. LOCAL STORAGE
+     ======================================================================== */
 
   const store = (() => {
     let usable = true;
@@ -1127,7 +1564,9 @@ mark.hit.on{background:var(--accent);color:#0f1118}
 
   const uid = () => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
 
-  /* ---------- window geometry ---------- */
+  /* ========================================================================
+     13. WINDOW GEOMETRY & VIEWPORT
+     ======================================================================== */
 
   const saved = store.get("window", null);
   let compact = false;
@@ -1237,7 +1676,9 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     }
   }
 
-  /* ---------- dragging ---------- */
+  /* ========================================================================
+     14. DRAGGING & RESIZING
+     ======================================================================== */
 
   function draggable() {
     return !minimized && !compact && mode === "normal";
@@ -1279,7 +1720,7 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     toggleZoom();
   });
 
-  /* ---------- resizing ---------- */
+  /* ---- resize handles ---------------------------------------------------- */
 
   for (const handle of root.querySelectorAll(".rz")) {
     handle.addEventListener("pointerdown", event => {
@@ -1327,7 +1768,9 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     });
   }
 
-  /* ---------- toasts ---------- */
+  /* ========================================================================
+     15. TOASTS
+     ======================================================================== */
 
   function toast(message, action) {
     const node = document.createElement("div");
@@ -1361,7 +1804,9 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     timer = setTimeout(dismiss, action ? 6000 : 2100);
   }
 
-  /* ---------- popover menus ---------- */
+  /* ========================================================================
+     16. POPOVER MENUS
+     ======================================================================== */
 
   let openMenuButton = null;
 
@@ -1373,36 +1818,20 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     menuEl.replaceChildren();
   }
 
-  function openMenu(button, title, items, onPick) {
+  // Claims the shared popover element. Returns false when the click was a
+  // toggle-closed on the already-open button.
+  function beginPopover(button) {
     if (openMenuButton === button) {
       closeMenu();
-      return;
+      return false;
     }
     closeMenu();
     openMenuButton = button;
     button.setAttribute("aria-expanded", "true");
+    return true;
+  }
 
-    const head = document.createElement("div");
-    head.className = "menuhead eyebrow";
-    head.textContent = title;
-    menuEl.appendChild(head);
-
-    for (const item of items) {
-      const node = document.createElement("button");
-      node.type = "button";
-      node.className = `menuitem${item.selected ? " on" : ""}`;
-      node.setAttribute("role", "menuitemradio");
-      node.setAttribute("aria-checked", String(!!item.selected));
-      node.innerHTML = `<span class="menutick">${ICONS.check}</span><span><span class="menulabel"></span>${item.description ? '<span class="menudesc"></span>' : ""}</span>`;
-      node.querySelector(".menulabel").textContent = item.label;
-      if (item.description) node.querySelector(".menudesc").textContent = item.description;
-      node.onclick = () => {
-        closeMenu();
-        onPick(item);
-      };
-      menuEl.appendChild(node);
-    }
-
+  function placePopover(button) {
     menuEl.hidden = false;
     menuEl.style.maxHeight = "";
     menuEl.style.overflowY = "";
@@ -1441,13 +1870,45 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     }
   }
 
+  function openMenu(button, title, items, onPick) {
+    if (!beginPopover(button)) return;
+
+    const head = document.createElement("div");
+    head.className = "menuhead eyebrow";
+    head.textContent = title;
+    menuEl.appendChild(head);
+
+    for (const item of items) {
+      const node = document.createElement("button");
+      node.type = "button";
+      node.className = `menuitem${item.selected ? " on" : ""}`;
+      node.setAttribute("role", "menuitemradio");
+      node.setAttribute("aria-checked", String(!!item.selected));
+      node.innerHTML = `<span class="menutick">${ICONS.check}</span><span><span class="menulabel"></span>${item.description ? '<span class="menudesc"></span>' : ""}</span>`;
+      node.querySelector(".menulabel").textContent = item.label;
+      if (item.description) node.querySelector(".menudesc").textContent = item.description;
+      node.onclick = () => {
+        closeMenu();
+        onPick(item);
+      };
+      menuEl.appendChild(node);
+    }
+
+    placePopover(button);
+  }
+
   rootEl.addEventListener("pointerdown", event => {
     if (!openMenuButton) return;
     if (event.target.closest(".menu") || event.target.closest("[aria-haspopup]")) return;
     closeMenu();
   }, true);
 
-  /* ---------- conversations ---------- */
+  /* ========================================================================
+     17. CONVERSATION GRAPH & BRANCHING
+     ------------------------------------------------------------------------
+     Each conversation is a tree of nodes keyed by id. `activeLeafId`
+     selects the path currently rendered and sent as history.
+     ======================================================================== */
 
   const MAX_CONVERSATIONS = 40;
   const MAX_STORED_THOUGHT = 4000;
@@ -1472,7 +1933,17 @@ mark.hit.on{background:var(--accent);color:#0f1118}
   }
 
   function emptyConversation() {
-    return { id: uid(), title: "New chat", createdAt: Date.now(), updatedAt: Date.now(), draft: "", nodes: {}, rootIds: [], activeLeafId: "" };
+    return {
+      id: uid(),
+      title: "New chat",
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      draft: "",
+      nodes: {},
+      rootIds: [],
+      activeLeafId: "",
+      d1Mirrored: false
+    };
   }
 
   function nodePath(conversation, leafId) {
@@ -1596,6 +2067,7 @@ mark.hit.on{background:var(--accent);color:#0f1118}
       conversation.updatedAt = Number(item.updatedAt) || Date.now();
       conversation.draft = typeof item.draft === "string" ? item.draft : "";
       conversation.titleLocked = item.titleLocked === true;
+      conversation.d1Mirrored = item.d1Mirrored === true;
 
       if (item.nodes && typeof item.nodes === "object" && !Array.isArray(item.nodes)) {
         for (const [key, value] of Object.entries(item.nodes)) {
@@ -1632,6 +2104,10 @@ mark.hit.on{background:var(--accent);color:#0f1118}
 
     return out;
   }
+
+  /* ========================================================================
+     18. PERSISTENCE & PRUNING
+     ======================================================================== */
 
   let prunedThisSession = "";
 
@@ -1704,6 +2180,10 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     clearTimeout(persistTimer);
     persistTimer = setTimeout(writeConversations, 220);
   }
+
+  /* ========================================================================
+     19. CONVERSATION LIFECYCLE
+     ======================================================================== */
 
   function activeConversation() {
     return conversations.find(item => item.id === activeId) || null;
@@ -1782,6 +2262,10 @@ mark.hit.on{background:var(--accent);color:#0f1118}
       }
     });
   }
+
+  /* ========================================================================
+     20. SIDEBAR & CHAT MANAGEMENT
+     ======================================================================== */
 
   function renderRail() {
     railList.replaceChildren();
@@ -1876,7 +2360,9 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     dockTitle.textContent = title;
   }
 
-  /* ---------- shared rendering helpers ---------- */
+  /* ========================================================================
+     21. SHARED RENDERING HELPERS
+     ======================================================================== */
 
   function miniButton(label, icon, handler) {
     const button = document.createElement("button");
@@ -1912,6 +2398,10 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     helper.remove();
     if (!copied) throw new Error("Clipboard access was denied.");
   }
+
+  /* ========================================================================
+     22. SYNTAX HIGHLIGHTING
+     ======================================================================== */
 
   const HL_ALIASES = {
     js: "js", javascript: "js", jsx: "js", mjs: "js", cjs: "js", node: "js",
@@ -2047,6 +2537,10 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     return html;
   }
 
+  /* ========================================================================
+     23. RENDERED-OUTPUT HELPERS
+     ======================================================================== */
+
   function enhanceCode(container) {
     for (const pre of container.querySelectorAll("pre")) {
       if (pre.parentElement?.classList.contains("codeblock")) continue;
@@ -2090,13 +2584,20 @@ mark.hit.on{background:var(--accent);color:#0f1118}
 
   function formatError(error) {
     if (error instanceof HttpError) return error.message;
-    if (error instanceof GenerationStoppedError) return `${error.reason}${error.message ? `\n\n${error.message}` : ""}`;
+    if (error instanceof GenerationStoppedError) {
+      if (error.reason === "CONTEXT_PARENT_NOT_FOUND" || error.reason === "CONTEXT_NOT_SYNCED") {
+        return `${error.reason}\n\nThis local branch is not mirrored in D1 yet. Start a new chat for now; the saved local chat remains on this device.`;
+      }
+      return `${error.reason}${error.message ? `\n\n${error.message}` : ""}`;
+    }
     if (error instanceof StreamInterruptedError) return error.message;
-    if (error instanceof TypeError) return `${error.message}\n\nThis page may be blocking the proxy through Content Security Policy, the network may be offline, or the request was interrupted.`;
+    if (error instanceof TypeError) return `${error.message}\n\nThis page may be blocking Google Forms/Sheets through Content Security Policy, the network may be offline, or the request was interrupted.`;
     return `${error?.name || "Error"}: ${error?.message || String(error)}`;
   }
 
-  /* ---------- smooth streaming writer ---------- */
+  /* ========================================================================
+     24. SMOOTHWRITER
+     ======================================================================== */
 
   class SmoothWriter {
     constructor(container, onPaint, speed = 1) {
@@ -2132,7 +2633,7 @@ mark.hit.on{background:var(--accent);color:#0f1118}
         return;
       }
       const backlog = this.pending.length;
-      let count = backlog > 2400 ? 150 : backlog > 1000 ? 80 : backlog > 420 ? 36 : backlog > 160 ? 16 : backlog > 50 ? 7 : backlog > 12 ? 4 : 2;
+      let count = backlog > 2400 ? Math.max(150, Math.ceil(backlog / 30)) : backlog > 1000 ? 80 : backlog > 420 ? 36 : backlog > 160 ? 16 : backlog > 50 ? 7 : backlog > 12 ? 4 : 2;
       count = Math.max(1, Math.round(count * this.speed));
       if (count < backlog && /[\uD800-\uDBFF]/.test(this.pending.charAt(count - 1))) count += 1;
       const next = this.pending.slice(0, count);
@@ -2192,7 +2693,9 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     }
   }
 
-  /* ---------- scrolling ---------- */
+  /* ========================================================================
+     25. SCROLLING & CONTEXT MARKER
+     ======================================================================== */
 
   let scrollFrame = 0;
 
@@ -2221,6 +2724,39 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     syncJump();
   }
 
+  function syncContextMarker() {
+    for (const stale of messages.querySelectorAll(".ctxmark")) stale.remove();
+    for (const turn of messages.querySelectorAll(".turn.outside")) turn.classList.remove("outside");
+
+    const conversation = activeConversation();
+    if (!conversation) return;
+    const path = currentPath(conversation);
+    if (!path.length) return;
+
+    const trimmed = trimHistory(path.map(node => ({
+      role: node.role,
+      text: node.text,
+      ...(node.state ? { state: node.state } : {})
+    })));
+    const dropped = path.length - trimmed.items.length;
+    if (dropped < 1) return;
+
+    const marker = document.createElement("div");
+    marker.className = "ctxmark";
+    marker.title = "These messages are still saved in this chat. They are no longer sent with new requests because the conversation passed the context budget.";
+    marker.innerHTML = '<span class="ctxrule"></span><span class="ctxbody"><span class="ctxtag">Context starts here</span><span class="ctxnote"></span></span><span class="ctxrule"></span>';
+    marker.querySelector(".ctxnote").textContent = `${dropped} earlier message${dropped === 1 ? "" : "s"} saved but no longer sent`;
+
+    const survivor = path[dropped];
+    const anchor = survivor ? messages.querySelector(`[data-turn="${survivor.id}"]`) : null;
+    if (anchor) messages.insertBefore(marker, anchor);
+    else messages.appendChild(marker);
+
+    for (const node of path.slice(0, dropped)) {
+      messages.querySelector(`[data-turn="${node.id}"]`)?.classList.add("outside");
+    }
+  }
+
   function pruneRenderedTurns() {
     const turns = Array.from(messages.querySelectorAll(".turn"));
     const excess = turns.length - SETTINGS.maxRenderedTurns;
@@ -2235,7 +2771,9 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     }
   }
 
-  /* ---------- user turns ---------- */
+  /* ========================================================================
+     26. USER-TURN RENDERING
+     ======================================================================== */
 
   function renderUserTurn(record, conversation) {
     const node = document.createElement("div");
@@ -2340,7 +2878,9 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     if (flag) flag.textContent = label;
   }
 
-  /* ---------- assistant turns ---------- */
+  /* ========================================================================
+     27. ASSISTANT-TURN RENDERING
+     ======================================================================== */
 
   function assistantShell(modelLabel, effortLabel) {
     const node = document.createElement("div");
@@ -2600,7 +3140,9 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     };
   }
 
-  /* ---------- thread rendering ---------- */
+  /* ========================================================================
+     28. THREAD RENDERING & BRANCH NAVIGATION
+     ======================================================================== */
 
   function renderThread(options = {}) {
     messages.classList.add("instant");
@@ -2619,12 +3161,46 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     syncChrome();
     updateSendState();
     findMarks = [];
+    syncContextMarker();
     requestAnimationFrame(() => {
+      const behavior = thread.style.scrollBehavior;
+      thread.style.scrollBehavior = "auto";
       thread.scrollTop = thread.scrollHeight;
+      thread.style.scrollBehavior = behavior;
       syncJump();
       messages.classList.remove("instant");
       if (findOpen) runFind(true);
     });
+  }
+
+  function appendPathTurns(conversation) {
+    const path = currentPath(conversation);
+    const rendered = [...messages.querySelectorAll(".turn")];
+
+    let shared = 0;
+    while (
+      shared < rendered.length &&
+      shared < path.length &&
+      rendered[shared].dataset.turn === path[shared].id
+    ) shared += 1;
+
+    // Anything already on screen that is not a prefix of the path means the
+    // history changed shape, so fall back to a full rebuild.
+    if (shared !== rendered.length) {
+      renderThread();
+      return;
+    }
+
+    for (const node of path.slice(shared)) {
+      if (node.role === "user") renderUserTurn(node, conversation);
+      else hydrateAssistantTurn(node, conversation);
+    }
+
+    syncEmpty();
+    syncChrome();
+    updateSendState();
+    syncContextMarker();
+    if (findOpen) runFind(true);
   }
 
   function resend(turnId, nextText) {
@@ -2648,12 +3224,63 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     runAssistant(conversation, parent);
   }
 
-  /* ---------- server configuration ---------- */
+  /* ========================================================================
+     29. MODEL & THINKING SELECTION
+     ======================================================================== */
 
   let serverConfig = null;
   let configReady = false;
   let modelId = store.get("modelId", "");
   let effortId = store.get("effortId", "");
+
+  /* Per-model temperature. null = Auto / provider default, number = custom.
+     Persisted through the existing `store` helper under one key. */
+  const TEMP_MIN = 0;
+  const TEMP_MAX = 1;
+  const TEMP_STEP = 0.05;
+  const TEMP_NEUTRAL = 0.5;
+
+  function clampTemperature(value) {
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed)) return TEMP_NEUTRAL;
+    const stepped = Math.round(parsed / TEMP_STEP) * TEMP_STEP;
+    return Number(Math.min(TEMP_MAX, Math.max(TEMP_MIN, stepped)).toFixed(2));
+  }
+
+  function sanitizeTemperatures(raw) {
+    const out = {};
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+    for (const [key, value] of Object.entries(raw)) {
+      if (!key) continue;
+      out[key] = typeof value === "number" && Number.isFinite(value) ? clampTemperature(value) : null;
+    }
+    return out;
+  }
+
+  let temperatureByModel = sanitizeTemperatures(store.get("temperatureByModel", {}));
+
+  /* Single read point for the rest of the app (and for later transport
+     wiring): null for Auto/provider default, number for Custom. */
+  function getSelectedTemperature() {
+    const value = temperatureByModel[modelId];
+    return typeof value === "number" ? value : null;
+  }
+
+  function setSelectedTemperature(value) {
+    if (!modelId) return;
+    temperatureByModel[modelId] = value === null ? null : clampTemperature(value);
+    store.set("temperatureByModel", temperatureByModel);
+    syncTemperature();
+  }
+
+  function syncTemperature() {
+    const value = getSelectedTemperature();
+    tempVal.textContent = value === null ? "Auto" : value.toFixed(2);
+    tempBtn.title = value === null
+      ? "Temperature: provider default"
+      : `Temperature: ${value.toFixed(2)} for this model`;
+  }
+
   let busy = false;
   let controller = null;
 
@@ -2697,6 +3324,7 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     store.set("modelId", modelId);
     const keep = model.thinking.some(option => option.id === effortId);
     applyEffort(keep ? effortId : model.defaultThinking, false);
+    syncTemperature();
     if (announce) toast(`Model: ${model.label}`);
   }
 
@@ -2713,6 +3341,12 @@ mark.hit.on{background:var(--accent);color:#0f1118}
       input.disabled = false;
       modelBtn.disabled = false;
       effortBtn.disabled = false;
+      tempBtn.disabled = false;
+      for (const entry of serverConfig.models) {
+        if (!(entry.id in temperatureByModel)) temperatureByModel[entry.id] = null;
+      }
+      store.set("temperatureByModel", temperatureByModel);
+      syncTemperature();
       setStatus("Ready");
       updateSendState();
       input.focus();
@@ -2725,6 +3359,7 @@ mark.hit.on{background:var(--accent);color:#0f1118}
       input.placeholder = "Not connected";
       modelBtn.disabled = true;
       effortBtn.disabled = true;
+      tempBtn.disabled = true;
       input.disabled = true;
       setStatus("Not connected", "bad");
       updateSendState();
@@ -2733,7 +3368,9 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     }
   }
 
-  /* ---------- composer state ---------- */
+  /* ========================================================================
+     30. COMPOSER STATE
+     ======================================================================== */
 
   function resizeInput() {
     input.style.height = "0px";
@@ -2766,7 +3403,9 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     updateSendState();
   }
 
-  /* ---------- run loop ---------- */
+  /* ========================================================================
+     31. GENERATION RUN LOOP
+     ======================================================================== */
 
   function submit(text, parentId) {
     const clean = String(text).trim();
@@ -2795,20 +3434,25 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     }
 
     conversation.activeLeafId = userNode.id;
-    renderThread();
+    appendPathTurns(conversation);
     scheduleScroll(true);
-
-    const priorNodes = userNode.parentId ? nodePath(conversation, userNode.parentId) : [];
-    const trimmed = trimHistory(priorNodes.map(node => ({
-      role: node.role,
-      text: node.text,
-      ...(node.state ? { state: node.state } : {})
-    })));
-    if (trimmed.removed) toast("Oldest context was trimmed to fit");
 
     const parentId = userNode.parentId;
     const text = userNode.text;
-    const retryHandler = () => submit(text, parentId);
+    const requestId = uid();
+    const assistantNodeId = uid();
+    const retryHandler = () => runAssistant(conversation, userNode);
+
+    const requestEnvelope = {
+      requestId,
+      conversationId: conversation.id,
+      userNodeId: userNode.id,
+      parentNodeId: parentId || "",
+      assistantNodeId,
+      model: model.id,
+      thinking: effort.id,
+      message: text
+    };
 
     const assistantView = createAssistantTurn(model, effort, () => {
       const leaf = conversation.nodes[conversation.activeLeafId];
@@ -2821,11 +3465,18 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     setBusy(true);
 
     try {
+      if (parentId && conversation.d1Mirrored !== true) {
+        throw new GenerationStoppedError(
+          "CONTEXT_NOT_SYNCED",
+          "This saved branch is not mirrored in the server-side context database."
+        );
+      }
+
       let result;
       while (true) {
         try {
           assistantView.setStatus(recoveryCount ? `Retrying ${recoveryCount}/${SETTINGS.maxNetworkRetries}` : "Working");
-          result = await openProxyRequest(trimmed.items, text, model.id, effort.id, controller.signal);
+          result = await openProxyRequest(requestEnvelope, controller.signal);
           break;
         } catch (error) {
           if (error?.name === "AbortError") throw error;
@@ -2840,6 +3491,19 @@ mark.hit.on{background:var(--accent);color:#0f1118}
           );
           await delay(waitMilliseconds, controller.signal);
         }
+      }
+
+      if (result.requestId && result.requestId !== requestId) {
+        throw new StreamInterruptedError("The Results mailbox returned the wrong request ID.");
+      }
+      if (result.conversationId && result.conversationId !== conversation.id) {
+        throw new StreamInterruptedError("The Results mailbox returned the wrong conversation ID.");
+      }
+      if (result.userNodeId && result.userNodeId !== userNode.id) {
+        throw new StreamInterruptedError("The Results mailbox returned the wrong user node ID.");
+      }
+      if (result.assistantNodeId && result.assistantNodeId !== assistantNodeId) {
+        throw new StreamInterruptedError("The Results mailbox returned the wrong assistant node ID.");
       }
 
       if (result.model?.label) {
@@ -2867,6 +3531,7 @@ mark.hit.on{background:var(--accent);color:#0f1118}
       ].filter(Boolean).join(" · ");
 
       const assistantNode = addNode(conversation, userNode.id, {
+        id: assistantNodeId,
         role: "assistant",
         text: fullAnswer,
         thought: (result.thought || "").slice(0, MAX_STORED_THOUGHT),
@@ -2876,8 +3541,10 @@ mark.hit.on{background:var(--accent);color:#0f1118}
         state: result.state || null
       });
       assistantView.node.dataset.turn = assistantNode.id;
+      conversation.d1Mirrored = true;
       touchConversation(conversation);
       syncChrome();
+      syncContextMarker();
 
       if (result.finishReason && result.finishReason !== "STOP") {
         assistantView.partial(
@@ -2893,8 +3560,13 @@ mark.hit.on{background:var(--accent);color:#0f1118}
       const switcher = branchSwitcher(conversation, assistantNode);
       if (switcher) assistantView.refs.actions.prepend(switcher);
     } catch (error) {
-      markUserStale(userNode.id, "not in context");
-      dropNode(conversation, userNode.id);
+      if (error instanceof GenerationStoppedError && error.reason === "CONTEXT_PARENT_NOT_FOUND") {
+        conversation.d1Mirrored = false;
+      }
+      // D1 may already contain this user node. Never delete/recreate it on a
+      // frontend failure; retries reuse the same local node with a new
+      // requestId + assistantNodeId and rely on D1's node idempotency.
+      markUserStale(userNode.id, error?.name === "AbortError" ? "request stopped" : "not answered");
       persist();
       if (error?.name === "AbortError") assistantView.stop(fullAnswer, retryHandler);
       else assistantView.fail(formatError(error), retryHandler);
@@ -2921,7 +3593,9 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     submit(text);
   }
 
-  /* ---------- find in chat ---------- */
+  /* ========================================================================
+     32. FIND IN CHAT
+     ======================================================================== */
 
   const findbar = $("#findbar");
   const findInput = $("#findInput");
@@ -2960,7 +3634,7 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     const walker = document.createTreeWalker(messages, NodeFilter.SHOW_TEXT, {
       acceptNode(node) {
         if (!node.nodeValue.trim()) return NodeFilter.FILTER_REJECT;
-        if (node.parentElement?.closest(".uactions,.aactions,.thinkhead,.codebar,.branch,.notice")) return NodeFilter.FILTER_REJECT;
+        if (node.parentElement?.closest(".uactions,.aactions,.thinkhead,.codebar,.branch,.notice,.ctxmark")) return NodeFilter.FILTER_REJECT;
         return NodeFilter.FILTER_ACCEPT;
       }
     });
@@ -3029,7 +3703,9 @@ mark.hit.on{background:var(--accent);color:#0f1118}
   $("#findNext").onclick = () => focusMatch(findAt + 1);
   $("#findClose").onclick = () => closeFind();
 
-  /* ---------- command palette ---------- */
+  /* ========================================================================
+     33. COMMAND PALETTE
+     ======================================================================== */
 
   const paletteEl = $("#palette");
   const palInput = $("#palInput");
@@ -3289,7 +3965,9 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     if (event.target === paletteEl) closePalette();
   });
 
-  /* ---------- controls ---------- */
+  /* ========================================================================
+     34. CONTROLS & EVENT LISTENERS
+     ======================================================================== */
 
   const SUGGESTIONS = [
     "Explain this in plain language",
@@ -3349,6 +4027,112 @@ mark.hit.on{background:var(--accent);color:#0f1118}
       description: model.provider,
       selected: model.id === modelId
     })), item => applyModel(item.id, true));
+  };
+
+  function openTemperatureMenu(button) {
+    if (!beginPopover(button)) return;
+
+    const head = document.createElement("div");
+    head.className = "menuhead eyebrow";
+    head.textContent = "Temperature";
+    menuEl.appendChild(head);
+
+    const panel = document.createElement("div");
+    panel.className = "temppanel";
+    panel.innerHTML = '<div class="tempseg" role="group" aria-label="Temperature mode">'
+      + '<button class="tempmode" type="button" data-mode="auto">Auto</button>'
+      + '<button class="tempmode" type="button" data-mode="custom">Custom</button>'
+      + '</div>'
+      + '<div class="temprow"><span class="templimit">0.00</span>'
+      + '<input class="tempslider" type="range" min="0" max="1" step="0.05" aria-label="Temperature">'
+      + '<span class="templimit">1.00</span></div>'
+      + '<div class="tempfoot">'
+      + '<input class="tempnum" type="text" inputmode="decimal" autocomplete="off" spellcheck="false" aria-label="Temperature value">'
+      + '<span class="temphint"></span></div>';
+    menuEl.appendChild(panel);
+
+    const autoButton = panel.querySelector('[data-mode="auto"]');
+    const customButton = panel.querySelector('[data-mode="custom"]');
+    const slider = panel.querySelector(".tempslider");
+    const numberField = panel.querySelector(".tempnum");
+    const hint = panel.querySelector(".temphint");
+
+    // Auto shows the neutral 0.50 position without ever storing it.
+    function paint() {
+      const value = getSelectedTemperature();
+      const auto = value === null;
+      const shown = auto ? TEMP_NEUTRAL : value;
+      panel.classList.toggle("auto", auto);
+      autoButton.classList.toggle("on", auto);
+      customButton.classList.toggle("on", !auto);
+      autoButton.setAttribute("aria-pressed", String(auto));
+      customButton.setAttribute("aria-pressed", String(!auto));
+      slider.disabled = auto;
+      numberField.disabled = auto;
+      slider.value = String(shown);
+      numberField.value = shown.toFixed(2);
+      hint.textContent = auto ? "Provider default" : "Custom for this model";
+    }
+
+    // Blank or unparseable text reverts to the last valid value rather than
+    // silently snapping to the neutral 0.50.
+    function commit() {
+      const current = getSelectedTemperature();
+      if (current === null) return;
+      const raw = numberField.value.trim();
+      const parsed = Number(raw);
+      const next = raw === "" || !Number.isFinite(parsed) ? current : clampTemperature(parsed);
+      setSelectedTemperature(next);
+      slider.value = String(next);
+      numberField.value = next.toFixed(2);
+    }
+
+    autoButton.onclick = () => {
+      setSelectedTemperature(null);
+      paint();
+    };
+
+    customButton.onclick = () => {
+      if (getSelectedTemperature() === null) setSelectedTemperature(TEMP_NEUTRAL);
+      paint();
+      numberField.focus();
+      numberField.select();
+    };
+
+    slider.addEventListener("input", () => {
+      const next = clampTemperature(slider.value);
+      setSelectedTemperature(next);
+      numberField.value = next.toFixed(2);
+    });
+
+    numberField.addEventListener("input", () => {
+      const raw = numberField.value.trim();
+      if (!raw) return;
+      const parsed = Number(raw);
+      if (!Number.isFinite(parsed)) return;
+      const next = clampTemperature(parsed);
+      setSelectedTemperature(next);
+      slider.value = String(next);
+    });
+
+    numberField.addEventListener("change", commit);
+    numberField.addEventListener("blur", commit);
+    numberField.addEventListener("keydown", event => {
+      if (event.key === "Escape") return;
+      event.stopPropagation();
+      if (event.key !== "Enter") return;
+      event.preventDefault();
+      commit();
+      numberField.blur();
+    });
+
+    paint();
+    placePopover(button);
+  }
+
+  tempBtn.onclick = () => {
+    if (!serverConfig) return;
+    openTemperatureMenu(tempBtn);
   };
 
   effortBtn.onclick = () => {
@@ -3429,7 +4213,9 @@ mark.hit.on{background:var(--accent);color:#0f1118}
     host.addEventListener(eventName, event => event.stopPropagation());
   }
 
-  /* ---------- lifecycle ---------- */
+  /* ========================================================================
+     35. LIFECYCLE & INITIALIZATION
+     ======================================================================== */
 
   const onViewportChange = () => syncViewport();
   addEventListener("resize", onViewportChange, { passive: true });
