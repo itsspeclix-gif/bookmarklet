@@ -1,0 +1,1265 @@
+javascript:(async function () {
+  const ROOT_ID = '__hk_lazyfs_stage3__';
+  const old = document.getElementById(ROOT_ID);
+  if (old) old.remove();
+
+  const COMMIT = 'd776aef07fb3ef5cd278d70c6f54742b27dd2f6d';
+  const BASE = 'https://cdn.jsdelivr.net/gh/itsspeclix-gif/games@' + COMMIT + '/';
+  const BUILD = BASE + 'build/';
+  const CACHE_LIMIT_MB = 24;
+  const ACTUAL_IOS =
+    /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+  const root = document.createElement('div');
+  root.id = ROOT_ID;
+  root.style.cssText = 'position:fixed;inset:0;z-index:2147483647;background:#000;';
+
+  const outer = document.createElement('iframe');
+  outer.allow = 'autoplay; fullscreen; gamepad';
+  outer.allowFullscreen = true;
+  outer.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;border:0;background:#000;';
+  outer.src = 'about:blank';
+
+  const hud = document.createElement('pre');
+  hud.style.cssText = [
+    'position:absolute',
+    'top:8px',
+    'left:8px',
+    'z-index:2147483647',
+    'margin:0',
+    'padding:8px 10px',
+    'max-width:min(500px,calc(100vw - 16px))',
+    'background:rgba(0,0,0,.76)',
+    'border:1px solid rgba(255,255,255,.24)',
+    'border-radius:6px',
+    'color:#fff',
+    'font:11px/1.42 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace',
+    'white-space:pre-wrap',
+    'word-break:break-word',
+    'pointer-events:none',
+    'backdrop-filter:blur(4px)',
+    '-webkit-backdrop-filter:blur(4px)'
+  ].join(';');
+  hud.textContent = 'HOLLOW KNIGHT — STABILITY FS V5.5\nBootstrapping…';
+
+  root.append(outer, hud);
+  document.body.appendChild(root);
+
+  const mb = n => (n / 1048576).toFixed(n >= 104857600 ? 0 : 1) + ' MB';
+  const escScript = s => s.replace(/<\/script/gi, '<\\/script');
+
+  let inner = null;
+  let gameWin = null;
+  let fps = 0;
+  let frames = 0;
+  let fpsT0 = performance.now();
+  let peakJs = 0;
+  let peakWasmUsed = 0;
+  let keyboardBridgeInstalled = false;
+  let keyboardForwarded = 0;
+  let saveSyncInstalled = false;
+  let saveSyncInFlight = false;
+  let saveSyncQueued = false;
+  let saveSyncTimer = null;
+  let saveSyncCount = 0;
+  let saveSyncErrors = 0;
+  let saveDirty = false;
+  let saveLastPath = '';
+  let saveLastSuccess = 0;
+
+  try {
+    hud.textContent = 'HOLLOW KNIGHT — STABILITY FS V5.5\nFetching 3 small bootstrap files…';
+
+    const [indexRes, loaderRes, frameworkRes] = await Promise.all([
+      fetch(BASE + 'index.html'),
+      fetch(BUILD + 'hk.loader.js?v=5'),
+      fetch(BUILD + 'hk.framework.js')
+    ]);
+
+    if (!indexRes.ok) throw new Error('index.html HTTP ' + indexRes.status);
+    if (!loaderRes.ok) throw new Error('hk.loader.js HTTP ' + loaderRes.status);
+    if (!frameworkRes.ok) throw new Error('hk.framework.js HTTP ' + frameworkRes.status);
+
+    let indexHtml = await indexRes.text();
+    let loaderSource = await loaderRes.text();
+    let frameworkSource = await frameworkRes.text();
+
+    loaderSource = loaderSource.replaceAll(
+      'https://cdn.jsdelivr.net/gh/itsspeclix-gif/games@main/',
+      BASE
+    );
+
+    const fsExportRE = /Module\.FS_createPath\s*=\s*FS\.createPath/;
+    if (!fsExportRE.test(frameworkSource)) {
+      throw new Error('Could not find Emscripten FS export hook in hk.framework.js');
+    }
+    frameworkSource = frameworkSource.replace(
+      fsExportRE,
+      match => 'Module.__FS=FS,Module.__MEMFS=MEMFS,Module.__hkDynamicTop=function(){try{return HEAP32[DYNAMICTOP_PTR>>2]}catch(e){return 0}},Module.__hkTotalMemory=function(){try{return TOTAL_MEMORY}catch(e){return 0}},' + match
+    );
+
+    const growthNeedle =
+      'TOTAL_MEMORY=TOTAL_MEMORY<=536870912?alignUp(2*TOTAL_MEMORY,e):Math.min(alignUp((3*TOTAL_MEMORY+2147483648)/4,e),i)';
+    const growthReplacement =
+      'TOTAL_MEMORY=TOTAL_MEMORY<268435456?alignUp(2*TOTAL_MEMORY,e):Math.min(alignUp(TOTAL_MEMORY+67108864,e),i)';
+
+    if (!frameworkSource.includes(growthNeedle)) {
+      throw new Error('Could not patch Emscripten memory growth policy');
+    }
+    frameworkSource = frameworkSource.replace(growthNeedle, growthReplacement);
+
+    let ow = outer.contentWindow;
+    let od = outer.contentDocument;
+
+    if (!ow || !od) {
+      await new Promise(resolve => setTimeout(resolve, 0));
+      ow = outer.contentWindow;
+      od = outer.contentDocument;
+    }
+
+    if (!ow || !od) {
+      throw new Error('Outer game frame document was not created');
+    }
+
+    if (!od.documentElement) {
+      od.open();
+      od.write('<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"></head><body></body></html>');
+      od.close();
+    }
+
+    od.documentElement.style.cssText = 'margin:0;width:100%;height:100%;overflow:hidden;background:#000;';
+    if (!od.body) {
+      od.documentElement.appendChild(od.createElement('body'));
+    }
+    od.body.style.cssText = 'margin:0;width:100%;height:100%;overflow:hidden;background:#000;';
+
+    const frameworkBlobUrl = ow.URL.createObjectURL(
+      new ow.Blob([frameworkSource], { type: 'text/javascript' })
+    );
+
+    const lazySource = String.raw`
+(() => {
+  'use strict';
+
+  const MAGIC = 'UnityWebData1.0\0';
+  const HEADER_PREFIX_SIZE = MAGIC.length + 4;
+  const BLOCK_SIZE = 2 * 1024 * 1024;
+  const RANGE_CACHE_LIMIT = 24 * 1024 * 1024;
+  const WHOLE_CACHE_LIMIT = 22 * 1024 * 1024;
+
+  const stats = window.__hkLazyStats = {
+    phase: 'waiting',
+    transport: 'probing',
+    rangeHost: '',
+    totalFiles: 0,
+    loadedFiles: 0,
+    cacheBytes: 0,
+    cacheLimit: RANGE_CACHE_LIMIT,
+    blockSize: BLOCK_SIZE,
+    syncPartLoads: 0,
+    syncBytes: 0,
+    asyncPrefetches: 0,
+    asyncPrefetchBytes: 0,
+    evictions: 0,
+    opens: 0,
+    closes: 0,
+    readCalls: 0,
+    readBytes: 0,
+    mmapCalls: 0,
+    mmapBytes: 0,
+    activeFile: '',
+    activePart: '',
+    lastFile: '',
+    fallbackReason: '',
+    lastError: ''
+  };
+
+  function setMessage(text) {
+    const el = document.getElementById('message');
+    if (el) el.textContent = text;
+  }
+
+  function fail(text) {
+    stats.lastError = text;
+    throw new Error(text);
+  }
+
+  function errorText(error) {
+    if (error && error.message) return error.message;
+    try { return String(error); } catch (_) { return 'Unknown error'; }
+  }
+
+  function readString(bytes, offset, length) {
+    let out = '';
+    for (let i = 0; i < length; i++) out += String.fromCharCode(bytes[offset + i]);
+    return out;
+  }
+
+  function validateMagic(bytes) {
+    if (bytes.byteLength < HEADER_PREFIX_SIZE) fail('HybridFS: archive header is too small');
+    if (readString(bytes, 0, MAGIC.length) !== MAGIC) fail('HybridFS: unexpected UnityWebData magic');
+  }
+
+  function parseArchive(header, totalSize) {
+    validateMagic(header);
+    const view = new DataView(header.buffer, header.byteOffset, header.byteLength);
+    const headerEnd = view.getUint32(MAGIC.length, true);
+
+    if (headerEnd < HEADER_PREFIX_SIZE || headerEnd > totalSize) {
+      fail('HybridFS: invalid archive header length');
+    }
+    if (headerEnd > header.byteLength) fail('HybridFS: incomplete archive header');
+
+    const entries = [];
+    let p = HEADER_PREFIX_SIZE;
+
+    while (p < headerEnd) {
+      if (p + 12 > headerEnd) fail('HybridFS: truncated archive record');
+
+      const offset = view.getUint32(p, true); p += 4;
+      const size = view.getUint32(p, true); p += 4;
+      const nameLength = view.getUint32(p, true); p += 4;
+
+      if (nameLength > headerEnd - p) fail('HybridFS: truncated archive filename');
+
+      const name = readString(header, p, nameLength);
+      p += nameLength;
+
+      if (offset > totalSize || size > totalSize - offset) {
+        fail('HybridFS: file outside archive');
+      }
+
+      entries.push({ offset, size, name });
+    }
+
+    if (p !== headerEnd) fail('HybridFS: malformed archive header boundary');
+    return entries;
+  }
+
+  function parseContentRange(value) {
+    const m = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(String(value || '').trim());
+    if (!m) return null;
+    return {
+      start: Number(m[1]),
+      end: Number(m[2]),
+      total: m[3] === '*' ? null : Number(m[3])
+    };
+  }
+
+  function withHost(url, host) {
+    const u = new URL(url);
+    u.host = host;
+    return u.href;
+  }
+
+  async function fetchBytes(url) {
+    const response = await fetch(url, { cache: 'force-cache' });
+    if (!response.ok) throw new Error('Could not load ' + url + ' (' + response.status + ')');
+    return new Uint8Array(await response.arrayBuffer());
+  }
+
+  async function asyncRange(url, start, end, host) {
+    const rangedUrl = withHost(url, host);
+    const response = await fetch(rangedUrl, {
+      headers: { Range: 'bytes=' + start + '-' + end },
+      cache: 'force-cache'
+    });
+
+    if (response.status !== 206) {
+      throw new Error('expected HTTP 206 from ' + host + ', got ' + response.status);
+    }
+
+    const range = parseContentRange(response.headers.get('Content-Range'));
+    if (!range || range.start !== start || range.end !== end) {
+      throw new Error('invalid Content-Range from ' + host);
+    }
+
+    const bytes = new Uint8Array(await response.arrayBuffer());
+    if (bytes.byteLength !== end - start + 1) {
+      throw new Error('range byte count mismatch from ' + host);
+    }
+
+    return { bytes, total: range.total };
+  }
+
+  async function chooseRangeHost(url) {
+    const originalHost = new URL(url).host;
+    const candidates = [];
+    for (const host of [originalHost, 'fastly.jsdelivr.net']) {
+      if (!candidates.includes(host)) candidates.push(host);
+    }
+
+    const errors = [];
+
+    for (const host of candidates) {
+      try {
+        const first = await asyncRange(url, 0, 63, host);
+        const middle = await asyncRange(url, 16, 31, host);
+
+        validateMagic(first.bytes);
+
+        for (let i = 0; i < middle.bytes.length; i++) {
+          if (middle.bytes[i] !== first.bytes[16 + i]) {
+            throw new Error('range bytes were shifted/corrupt');
+          }
+        }
+
+        return { host, total: first.total };
+      } catch (error) {
+        errors.push(host + ': ' + errorText(error));
+      }
+    }
+
+    throw new Error(errors.join(' | '));
+  }
+
+  function syncRangeRaw(url, start, end, host) {
+    const rangedUrl = withHost(url, host);
+    let xhr;
+
+    try {
+      xhr = new XMLHttpRequest();
+      xhr.open('GET', rangedUrl, false);
+      xhr.setRequestHeader('Range', 'bytes=' + start + '-' + end);
+      if (xhr.overrideMimeType) {
+        xhr.overrideMimeType('text/plain; charset=x-user-defined');
+      }
+      xhr.send(null);
+    } catch (error) {
+      throw new Error('sync Range XHR rejected: ' + errorText(error));
+    }
+
+    if (xhr.status !== 206) {
+      throw new Error('sync Range expected 206, got ' + xhr.status);
+    }
+
+    const range = parseContentRange(xhr.getResponseHeader('Content-Range'));
+    if (!range || range.start !== start || range.end !== end) {
+      throw new Error('sync Range returned invalid Content-Range');
+    }
+
+    const text = xhr.responseText || '';
+    const expected = end - start + 1;
+
+    if (text.length !== expected) {
+      throw new Error('sync Range length mismatch: expected ' + expected + ', got ' + text.length);
+    }
+
+    const bytes = new Uint8Array(text.length);
+    for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i) & 255;
+    return bytes;
+  }
+
+  function syncWhole(url) {
+    stats.activePart = url.split('/').pop() || url;
+    stats.phase = 'sync-whole';
+    setMessage('Streaming ' + stats.activePart + '…');
+
+    let xhr;
+
+    try {
+      xhr = new XMLHttpRequest();
+      xhr.open('GET', url, false);
+      if (xhr.overrideMimeType) {
+        xhr.overrideMimeType('text/plain; charset=x-user-defined');
+      }
+      xhr.send(null);
+    } catch (error) {
+      fail('HybridFS whole-part XHR failed: ' + errorText(error));
+    }
+
+    if (!(xhr.status >= 200 && xhr.status < 300) && xhr.status !== 304 && xhr.status !== 0) {
+      fail('HybridFS HTTP ' + xhr.status + ' for ' + stats.activePart);
+    }
+
+    const text = xhr.responseText || '';
+    const bytes = new Uint8Array(text.length);
+    for (let i = 0; i < text.length; i++) bytes[i] = text.charCodeAt(i) & 255;
+
+    stats.syncPartLoads++;
+    stats.syncBytes += bytes.byteLength;
+    stats.activePart = '';
+    return bytes;
+  }
+
+  function createDirectories(module, fileName) {
+    for (
+      let start = 0, slash = fileName.indexOf('/', start) + 1;
+      slash > 0;
+      start = slash, slash = fileName.indexOf('/', start) + 1
+    ) {
+      module.FS_createPath(
+        fileName.substring(0, start),
+        fileName.substring(start, slash - 1),
+        true,
+        true
+      );
+    }
+  }
+
+  async function headerFromWholeParts(urls, firstPart, partSize, totalSize) {
+    validateMagic(firstPart);
+    const view = new DataView(firstPart.buffer, firstPart.byteOffset, firstPart.byteLength);
+    const headerEnd = view.getUint32(MAGIC.length, true);
+
+    if (headerEnd < HEADER_PREFIX_SIZE || headerEnd > totalSize) {
+      fail('HybridFS: invalid header extent');
+    }
+
+    if (headerEnd <= firstPart.byteLength) return firstPart.slice(0, headerEnd);
+
+    const header = new Uint8Array(headerEnd);
+    let copied = 0;
+    let partIndex = 0;
+
+    while (copied < headerEnd) {
+      const part = partIndex === 0 ? firstPart : await fetchBytes(urls[partIndex]);
+      const count = Math.min(part.byteLength, headerEnd - copied);
+      header.set(part.subarray(0, count), copied);
+      copied += count;
+      partIndex++;
+    }
+
+    return header;
+  }
+
+  async function headerFromRanges(urls, partSize, totalSize, rangeHost) {
+    const prefix = await asyncRange(urls[0], 0, HEADER_PREFIX_SIZE - 1, rangeHost);
+    validateMagic(prefix.bytes);
+
+    const view = new DataView(prefix.bytes.buffer, prefix.bytes.byteOffset, prefix.bytes.byteLength);
+    const headerEnd = view.getUint32(MAGIC.length, true);
+
+    if (headerEnd < HEADER_PREFIX_SIZE || headerEnd > totalSize) {
+      fail('HybridFS: invalid header extent');
+    }
+
+    const header = new Uint8Array(headerEnd);
+    let archiveOffset = 0;
+    let target = 0;
+    let remaining = headerEnd;
+
+    while (remaining > 0) {
+      const partIndex = Math.floor(archiveOffset / partSize);
+      const offsetInPart = archiveOffset % partSize;
+      const count = Math.min(remaining, partSize - offsetInPart);
+
+      const r = await asyncRange(
+        urls[partIndex],
+        offsetInPart,
+        offsetInPart + count - 1,
+        rangeHost
+      );
+
+      header.set(r.bytes, target);
+      archiveOffset += count;
+      target += count;
+      remaining -= count;
+    }
+
+    return header;
+  }
+
+  window.mountUnityDataParts = async function mountUnityDataParts(module, urls, options) {
+    if (!module || !module.__FS || typeof module.FS_createDataFile !== 'function') {
+      fail('HybridFS: patched Emscripten FS was not exported');
+    }
+    if (!Array.isArray(urls) || urls.length < 1) fail('HybridFS: no data part URLs');
+
+    const FS = module.__FS;
+    const touchedFiles = new Set();
+
+    let transport = 'whole';
+    let rangeHost = '';
+    let partSize = 0;
+    let partLengths = null;
+    let totalSize = 0;
+    let header = null;
+
+    const rangeCache = new Map();
+    const prefetching = new Map();
+    const wholeCache = new Map();
+
+    stats.phase = 'transport-probe';
+    setMessage('Checking iPad-compatible data transport…');
+
+    try {
+      const rangeChoice = await chooseRangeHost(urls[0]);
+      rangeHost = rangeChoice.host;
+
+      // This is the important Safari test. Async fetch may support Range while
+      // synchronous XHR does not. Test the exact mechanism before Unity starts.
+      const probe = syncRangeRaw(urls[0], 0, 0, rangeHost);
+      if (probe.byteLength !== 1) throw new Error('sync Range probe returned wrong size');
+
+      transport = 'range';
+      stats.transport = '2MB ranges';
+      stats.rangeHost = rangeHost;
+      stats.cacheLimit = RANGE_CACHE_LIMIT;
+
+      const firstInfo = await asyncRange(urls[0], 0, 0, rangeHost);
+      const lastInfo = await asyncRange(urls[urls.length - 1], 0, 0, rangeHost);
+
+      if (!firstInfo.total || !lastInfo.total) {
+        throw new Error('range transport did not expose file lengths');
+      }
+
+      partSize = firstInfo.total;
+      partLengths = new Array(urls.length).fill(partSize);
+      partLengths[urls.length - 1] = lastInfo.total;
+      totalSize = partSize * (urls.length - 1) + lastInfo.total;
+
+      header = await headerFromRanges(urls, partSize, totalSize, rangeHost);
+    } catch (rangeError) {
+      transport = 'whole';
+      stats.transport = 'whole-part fallback';
+      stats.rangeHost = '';
+      stats.cacheLimit = WHOLE_CACHE_LIMIT;
+      stats.fallbackReason = errorText(rangeError);
+      stats.lastError = '';
+      stats.phase = 'whole-fallback';
+      setMessage('Using iPad-compatible whole-part transport…');
+
+      const firstPart = await fetchBytes(urls[0]);
+      const finalPart = urls.length > 1 ? await fetchBytes(urls[urls.length - 1]) : firstPart;
+
+      partSize = firstPart.byteLength;
+      if (!partSize) fail('HybridFS: first data part is empty');
+
+      partLengths = new Array(urls.length).fill(partSize);
+      partLengths[urls.length - 1] = finalPart.byteLength;
+      totalSize = partSize * (urls.length - 1) + finalPart.byteLength;
+
+      wholeCache.set(0, { bytes: firstPart, lastUse: performance.now() });
+
+      header = await headerFromWholeParts(urls, firstPart, partSize, totalSize);
+    }
+
+    const entries = parseArchive(header, totalSize);
+    stats.totalFiles = entries.length;
+
+    function markTouched(entry) {
+      if (!touchedFiles.has(entry.name)) {
+        touchedFiles.add(entry.name);
+        stats.loadedFiles = touchedFiles.size;
+      }
+      stats.lastFile = entry.name;
+    }
+
+    function refreshCacheStats() {
+      let total = 0;
+      const cache = transport === 'range' ? rangeCache : wholeCache;
+      for (const record of cache.values()) total += record.bytes.byteLength;
+      stats.cacheBytes = total;
+    }
+
+    function touch(cache, key, record) {
+      record.lastUse = performance.now();
+      cache.delete(key);
+      cache.set(key, record);
+    }
+
+    function trim(cache, limit, keepKey) {
+      refreshCacheStats();
+
+      while (stats.cacheBytes > limit && cache.size > 1) {
+        let victim = null;
+
+        for (const key of cache.keys()) {
+          if (key !== keepKey) {
+            victim = key;
+            break;
+          }
+        }
+
+        if (victim === null) break;
+
+        cache.delete(victim);
+        stats.evictions++;
+        refreshCacheStats();
+      }
+    }
+
+    function rangeKey(partIndex, blockIndex) {
+      return partIndex + ':' + blockIndex;
+    }
+
+    function blockBounds(partIndex, blockIndex) {
+      const length = partLengths[partIndex];
+      const start = blockIndex * BLOCK_SIZE;
+      if (start >= length) fail('HybridFS: block outside data part');
+      const end = Math.min(length - 1, start + BLOCK_SIZE - 1);
+      return { start, end };
+    }
+
+    function getRangeBlock(partIndex, blockIndex) {
+      const key = rangeKey(partIndex, blockIndex);
+      const cached = rangeCache.get(key);
+
+      if (cached) {
+        touch(rangeCache, key, cached);
+        return cached.bytes;
+      }
+
+      const bounds = blockBounds(partIndex, blockIndex);
+      stats.activePart = 'part' + (partIndex + 1) + ':' + bounds.start + '-' + bounds.end;
+      stats.phase = 'sync-range';
+
+      let bytes;
+      try {
+        bytes = syncRangeRaw(urls[partIndex], bounds.start, bounds.end, rangeHost);
+      } catch (error) {
+        fail('HybridFS Range transport failed after startup: ' + errorText(error));
+      }
+
+      stats.syncPartLoads++;
+      stats.syncBytes += bytes.byteLength;
+      stats.activePart = '';
+
+      const record = { bytes, lastUse: performance.now() };
+      rangeCache.set(key, record);
+      touch(rangeCache, key, record);
+      trim(rangeCache, RANGE_CACHE_LIMIT, key);
+
+      const nextBlock = blockIndex + 1;
+      const nextStart = nextBlock * BLOCK_SIZE;
+
+      if (nextStart < partLengths[partIndex]) {
+        const nextKey = rangeKey(partIndex, nextBlock);
+
+        if (!rangeCache.has(nextKey) && !prefetching.has(nextKey)) {
+          const nextBounds = blockBounds(partIndex, nextBlock);
+
+          const p = asyncRange(
+            urls[partIndex],
+            nextBounds.start,
+            nextBounds.end,
+            rangeHost
+          ).then(result => {
+            stats.asyncPrefetches++;
+            stats.asyncPrefetchBytes += result.bytes.byteLength;
+
+            if (!rangeCache.has(nextKey)) {
+              const nextRecord = { bytes: result.bytes, lastUse: performance.now() };
+              rangeCache.set(nextKey, nextRecord);
+              touch(rangeCache, nextKey, nextRecord);
+              trim(rangeCache, RANGE_CACHE_LIMIT, nextKey);
+            }
+          }).catch(() => {
+          }).finally(() => {
+            prefetching.delete(nextKey);
+          });
+
+          prefetching.set(nextKey, p);
+        }
+      }
+
+      return bytes;
+    }
+
+    function getWholePart(partIndex) {
+      const cached = wholeCache.get(partIndex);
+
+      if (cached) {
+        touch(wholeCache, partIndex, cached);
+        return cached.bytes;
+      }
+
+      const bytes = syncWhole(urls[partIndex]);
+      const record = { bytes, lastUse: performance.now() };
+
+      wholeCache.set(partIndex, record);
+      touch(wholeCache, partIndex, record);
+      trim(wholeCache, WHOLE_CACHE_LIMIT, partIndex);
+
+      return bytes;
+    }
+
+    function readRangeInto(entry, filePosition, length, target, targetOffset) {
+      if (length <= 0 || filePosition >= entry.size) return 0;
+      if (filePosition < 0) fail('HybridFS: negative file position for ' + entry.name);
+
+      const wanted = Math.min(length, entry.size - filePosition);
+      let archiveOffset = entry.offset + filePosition;
+      let destination = targetOffset;
+      let remaining = wanted;
+
+      while (remaining > 0) {
+        const partIndex = Math.floor(archiveOffset / partSize);
+        const offsetInPart = archiveOffset % partSize;
+
+        if (transport === 'range') {
+          const blockIndex = Math.floor(offsetInPart / BLOCK_SIZE);
+          const offsetInBlock = offsetInPart % BLOCK_SIZE;
+          const block = getRangeBlock(partIndex, blockIndex);
+          const count = Math.min(remaining, block.byteLength - offsetInBlock);
+
+          if (count <= 0) fail('HybridFS: invalid zero-length range read');
+
+          target.set(block.subarray(offsetInBlock, offsetInBlock + count), destination);
+          archiveOffset += count;
+          destination += count;
+          remaining -= count;
+        } else {
+          const part = getWholePart(partIndex);
+
+          if (offsetInPart >= part.byteLength) {
+            fail('HybridFS: file points outside part ' + (partIndex + 1));
+          }
+
+          const count = Math.min(remaining, part.byteLength - offsetInPart);
+
+          target.set(part.subarray(offsetInPart, offsetInPart + count), destination);
+          archiveOffset += count;
+          destination += count;
+          remaining -= count;
+        }
+      }
+
+      markTouched(entry);
+      return wanted;
+    }
+
+    refreshCacheStats();
+    stats.phase = 'register';
+    setMessage('Registering virtual game files…');
+
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+      createDirectories(module, entry.name);
+
+      module.FS_createDataFile(
+        entry.name,
+        null,
+        new Uint8Array(0),
+        true,
+        true,
+        true
+      );
+
+      const node = FS.lookupPath(entry.name).node;
+      node.usedBytes = entry.size;
+      node.contents = null;
+      node.__hkOpenCount = 0;
+
+      const baseOps = node.stream_ops;
+      const ops = {};
+      for (const key in baseOps) ops[key] = baseOps[key];
+
+      ops.open = function() {
+        node.__hkOpenCount++;
+        stats.opens++;
+        markTouched(entry);
+      };
+
+      ops.close = function() {
+        node.__hkOpenCount = Math.max(0, node.__hkOpenCount - 1);
+        stats.closes++;
+      };
+
+      ops.read = function(stream, buffer, offset, length, position) {
+        stats.activeFile = entry.name;
+        stats.phase = transport === 'range' ? 'range-read' : 'whole-read';
+        stats.readCalls++;
+
+        try {
+          const count = readRangeInto(entry, position, length, buffer, offset);
+          stats.readBytes += count;
+          return count;
+        } catch (error) {
+          stats.lastError = errorText(error);
+          throw error;
+        } finally {
+          stats.activeFile = '';
+        }
+      };
+
+      ops.mmap = function(stream, buffer, address, length, position, prot, flags) {
+        stats.activeFile = entry.name;
+        stats.phase = transport === 'range' ? 'range-mmap' : 'whole-mmap';
+        stats.mmapCalls++;
+
+        const ptr = module._malloc(length);
+        if (!ptr) {
+          stats.lastError = 'HybridFS: WASM malloc failed while mapping ' + entry.name;
+          throw new FS.ErrnoError(12);
+        }
+
+        try {
+          const count = readRangeInto(entry, position, length, buffer, ptr);
+          if (count < length) buffer.fill(0, ptr + count, ptr + length);
+          stats.mmapBytes += length;
+          return { ptr, allocated: true };
+        } catch (error) {
+          module._free(ptr);
+          stats.lastError = errorText(error);
+          throw error;
+        } finally {
+          stats.activeFile = '';
+        }
+      };
+
+      ops.write = function() {
+        stats.lastError = 'HybridFS: unexpected write to read-only asset ' + entry.name;
+        throw new FS.ErrnoError(30);
+      };
+
+      node.stream_ops = ops;
+
+      if (options && options.onProgress && (i % 20 === 0 || i + 1 === entries.length)) {
+        options.onProgress({
+          phase: 'mounting',
+          filesMounted: i + 1,
+          totalFiles: entries.length
+        });
+      }
+    }
+
+    stats.phase = 'ready';
+
+    if (options && options.onProgress) {
+      options.onProgress({
+        phase: 'complete',
+        filesMounted: entries.length,
+        totalFiles: entries.length
+      });
+    }
+
+    setMessage('Starting game with ' + stats.transport + '…');
+  };
+})();`;
+
+    indexHtml = indexHtml.replaceAll(
+      'https://cdn.jsdelivr.net/gh/itsspeclix-gif/games@main/',
+      BASE
+    );
+
+    // Preserve non-Error rejection details on Safari/iPad instead of displaying
+    // "Unable to start: undefined".
+    indexHtml = indexHtml.replace(
+      /message\.textContent\s*=\s*`Unable to start:\s*\$\{error\.message\}`\s*;/,
+      "message.textContent = 'Unable to start: ' + (error && error.message ? error.message : String(error));"
+    );
+
+    indexHtml = indexHtml.replace(
+      /devicePixelRatio\s*:\s*isIOS\s*\?\s*1\s*:\s*window\.devicePixelRatio/,
+      'devicePixelRatio: ' + (ACTUAL_IOS ? '0.80' : '1')
+    );
+
+    const iosStart = indexHtml.indexOf('const isIOS');
+    const iosEnd = iosStart >= 0 ? indexHtml.indexOf(';', iosStart) : -1;
+    if (iosStart < 0 || iosEnd < 0) {
+      throw new Error('Could not locate isIOS declaration');
+    }
+    indexHtml =
+      indexHtml.slice(0, iosStart) +
+      'const isIOS = true;' +
+      indexHtml.slice(iosEnd + 1);
+
+    const multipartLoadRE = /await\s+loadScript\(assetBase\s*\+\s*['"]hk\.multipart-data\.js\?v=1['"]\)\s*;/;
+    const loaderLoadRE = /await\s+loadScript\(assetBase\s*\+\s*['"]hk\.loader\.js\?v=5['"]\)\s*;/;
+
+    if (!multipartLoadRE.test(indexHtml) || !loaderLoadRE.test(indexHtml)) {
+      throw new Error('Could not patch bootstrap script loads');
+    }
+    indexHtml = indexHtml.replace(multipartLoadRE, '/* LazyFS supplied inline. */');
+    indexHtml = indexHtml.replace(loaderLoadRE, '/* Unity loader supplied inline. */');
+
+    const frameworkRE = /frameworkUrl\s*:\s*assetBase\s*\+\s*['"]hk\.framework\.js['"]\s*,/;
+    if (!frameworkRE.test(indexHtml)) throw new Error('Could not patch frameworkUrl');
+    indexHtml = indexHtml.replace(
+      frameworkRE,
+      'frameworkUrl: ' + JSON.stringify(frameworkBlobUrl) + ','
+    );
+
+    const unityStartRE = /await\s+createUnityInstance\(canvas,\s*unityConfig,\s*value\s*=>\s*\{\s*progress\.value\s*=\s*value;\s*\}\s*\)\s*;/;
+    indexHtml = indexHtml.replace(
+      unityStartRE,
+      'window.__hkUnityInstance = await createUnityInstance(canvas, unityConfig, value => { progress.value = value; });'
+    );
+
+    const injectedHead =
+      '<head$1><base href="' + BASE + '">' +
+      '<script>' + escScript(loaderSource) + '</script>' +
+      '<script>' + escScript(lazySource) + '</script>';
+
+    indexHtml = indexHtml.replace(/<head([^>]*)>/i, injectedHead);
+
+    const gameBlobUrl = ow.URL.createObjectURL(
+      new ow.Blob([indexHtml], { type: 'text/html' })
+    );
+
+    inner = od.createElement('iframe');
+    inner.allow = 'autoplay; fullscreen; gamepad';
+    inner.allowFullscreen = true;
+    inner.style.cssText = 'position:absolute;inset:0;width:100%;height:100%;border:0;background:#000;';
+
+    inner.addEventListener('load', () => {
+      try {
+        gameWin = inner.contentWindow;
+
+        const focusGame = () => {
+          try {
+            if (!gameWin) return;
+            gameWin.focus();
+
+            const doc = gameWin.document;
+            if (!doc) return;
+
+            const canvas = doc.getElementById('game');
+            if (canvas) {
+              if (!canvas.hasAttribute('tabindex')) canvas.tabIndex = 0;
+              try { canvas.focus({ preventScroll: true }); }
+              catch (_) { canvas.focus(); }
+            }
+          } catch (_) {}
+        };
+
+        const cloneKeyboardEvent = event => {
+          try {
+            return new gameWin.KeyboardEvent(event.type, {
+              key: event.key,
+              code: event.code,
+              location: event.location,
+              ctrlKey: event.ctrlKey,
+              shiftKey: event.shiftKey,
+              altKey: event.altKey,
+              metaKey: event.metaKey,
+              repeat: event.repeat,
+              isComposing: event.isComposing,
+              bubbles: true,
+              cancelable: true
+            });
+          } catch (_) {
+            const ev = gameWin.document.createEvent('Event');
+            ev.initEvent(event.type, true, true);
+            try {
+              Object.defineProperties(ev, {
+                key: { value: event.key },
+                code: { value: event.code },
+                keyCode: { value: event.keyCode },
+                which: { value: event.which },
+                ctrlKey: { value: event.ctrlKey },
+                shiftKey: { value: event.shiftKey },
+                altKey: { value: event.altKey },
+                metaKey: { value: event.metaKey },
+                repeat: { value: event.repeat }
+              });
+            } catch (_) {}
+            return ev;
+          }
+        };
+
+        const forwardKeyboard = event => {
+          try {
+            if (!gameWin || !gameWin.document) return;
+
+            // If the event is already coming from the game document, do not
+            // synthesize a duplicate.
+            if (event.view === gameWin || event.target === gameWin.document) return;
+
+            const doc = gameWin.document;
+            const canvas = doc.getElementById('game');
+
+            focusGame();
+
+            const forwarded = cloneKeyboardEvent(event);
+
+            // Unity/Emscripten keyboard callbacks can be attached to either
+            // document/window/canvas depending on build details. Dispatch on
+            // document first; bubbling reaches window in this build.
+            doc.dispatchEvent(forwarded);
+            keyboardForwarded++;
+
+            // Prevent Safari/parent-page shortcuts from consuming gameplay
+            // keys when the bridge handled them. Leave browser/system combos.
+            if (!(event.metaKey || event.ctrlKey || event.altKey)) {
+              event.preventDefault();
+              event.stopPropagation();
+            }
+
+            if (canvas) {
+              try { canvas.focus({ preventScroll: true }); }
+              catch (_) { try { canvas.focus(); } catch (_) {} }
+            }
+          } catch (_) {}
+        };
+
+        const installKeyboardBridge = () => {
+          if (keyboardBridgeInstalled) return;
+          keyboardBridgeInstalled = true;
+
+          // Capture keys wherever Safari happens to leave focus.
+          document.addEventListener('keydown', forwardKeyboard, true);
+          document.addEventListener('keyup', forwardKeyboard, true);
+
+          try {
+            const odoc = outer.contentDocument;
+            if (odoc) {
+              odoc.addEventListener('keydown', forwardKeyboard, true);
+              odoc.addEventListener('keyup', forwardKeyboard, true);
+            }
+          } catch (_) {}
+
+          // Refocus after taps, visibility changes, and focus transitions.
+          try {
+            const gdoc = gameWin.document;
+            gdoc.addEventListener('pointerdown', focusGame, true);
+            gdoc.addEventListener('mousedown', focusGame, true);
+            gdoc.addEventListener('touchstart', focusGame, { capture: true, passive: true });
+            gdoc.addEventListener('focusin', () => setTimeout(focusGame, 0), true);
+            gdoc.addEventListener('visibilitychange', () => {
+              if (!gdoc.hidden) setTimeout(focusGame, 0);
+            });
+          } catch (_) {}
+
+          window.addEventListener('focus', () => setTimeout(focusGame, 0), true);
+        };
+
+        installKeyboardBridge();
+
+        setTimeout(focusGame, 0);
+        setTimeout(focusGame, 150);
+        setTimeout(focusGame, 500);
+        setTimeout(focusGame, 1500);
+
+        const tick = now => {
+          frames++;
+          const dt = now - fpsT0;
+          if (dt >= 1000) {
+            fps = frames * 1000 / dt;
+            frames = 0;
+            fpsT0 = now;
+          }
+          if (gameWin) gameWin.requestAnimationFrame(tick);
+        };
+
+        if (gameWin) gameWin.requestAnimationFrame(tick);
+      } catch (_) {}
+    }, { once: true });
+
+    inner.src = gameBlobUrl;
+    od.body.appendChild(inner);
+
+    const installPersistentSaveSync = w => {
+      if (saveSyncInstalled) return;
+
+      try {
+        const inst = w && w.__hkUnityInstance;
+        const module = inst && inst.Module;
+        const FS = module && module.__FS;
+
+        if (!FS || !FS.trackingDelegate || typeof FS.syncfs !== 'function') return;
+
+        saveSyncInstalled = true;
+
+        const previousWrite = FS.trackingDelegate.onWriteToFile;
+        const previousMove = FS.trackingDelegate.onMovePath;
+        const previousDelete = FS.trackingDelegate.onDeletePath;
+
+        const isPersistentPath = path =>
+          typeof path === 'string' &&
+          (path === '/idbfs' || path.indexOf('/idbfs/') === 0);
+
+        const runSync = () => {
+          saveSyncTimer = null;
+
+          if (!saveDirty) return;
+
+          if (saveSyncInFlight) {
+            saveSyncQueued = true;
+            return;
+          }
+
+          saveSyncInFlight = true;
+          saveSyncQueued = false;
+          saveDirty = false;
+
+          try {
+            FS.syncfs(false, error => {
+              saveSyncInFlight = false;
+
+              if (error) {
+                saveSyncErrors++;
+                saveDirty = true;
+              } else {
+                saveSyncCount++;
+                saveLastSuccess = performance.now();
+              }
+
+              if (saveSyncQueued || saveDirty) {
+                saveSyncQueued = false;
+                if (saveSyncTimer) clearTimeout(saveSyncTimer);
+                saveSyncTimer = setTimeout(runSync, 200);
+              }
+            });
+          } catch (_) {
+            saveSyncInFlight = false;
+            saveSyncErrors++;
+            saveDirty = true;
+          }
+        };
+
+        const markPersistentChange = path => {
+          if (!isPersistentPath(path)) return;
+
+          saveDirty = true;
+          saveLastPath = path;
+
+          if (saveSyncTimer) clearTimeout(saveSyncTimer);
+          saveSyncTimer = setTimeout(runSync, 350);
+        };
+
+        FS.trackingDelegate.onWriteToFile = function(path) {
+          try {
+            if (typeof previousWrite === 'function') previousWrite.apply(this, arguments);
+          } catch (_) {}
+          markPersistentChange(path);
+        };
+
+        FS.trackingDelegate.onMovePath = function(oldPath, newPath) {
+          try {
+            if (typeof previousMove === 'function') previousMove.apply(this, arguments);
+          } catch (_) {}
+          if (isPersistentPath(oldPath)) markPersistentChange(oldPath);
+          if (isPersistentPath(newPath)) markPersistentChange(newPath);
+        };
+
+        FS.trackingDelegate.onDeletePath = function(path) {
+          try {
+            if (typeof previousDelete === 'function') previousDelete.apply(this, arguments);
+          } catch (_) {}
+          markPersistentChange(path);
+        };
+
+        // Safety net: if a persistent write was observed but a callback was
+        // delayed/interrupted, retry periodically while the game remains alive.
+        w.setInterval(() => {
+          if (saveDirty && !saveSyncInFlight && !saveSyncTimer) {
+            saveSyncTimer = setTimeout(runSync, 0);
+          }
+        }, 2000);
+
+        // Best-effort final flush when Safari backgrounds the game. The regular
+        // write-triggered sync is the primary protection because pagehide cannot
+        // be awaited reliably.
+        w.addEventListener('pagehide', () => {
+          if (saveDirty && !saveSyncInFlight) {
+            try { FS.syncfs(false, () => {}); } catch (_) {}
+          }
+        });
+
+        w.document.addEventListener('visibilitychange', () => {
+          if (w.document.hidden && saveDirty && !saveSyncInFlight) {
+            try { FS.syncfs(false, () => {}); } catch (_) {}
+          }
+        });
+      } catch (_) {}
+    };
+
+    setInterval(() => {
+      let w = null;
+      try { w = inner && inner.contentWindow; } catch (_) {}
+
+      if (!w) {
+        let detail = 'Waiting for game document…';
+        try {
+          if (outer.contentDocument !== od) {
+            detail = 'Outer frame document changed unexpectedly';
+          } else if (inner && !inner.isConnected) {
+            detail = 'Game iframe was detached';
+          }
+        } catch (_) {}
+        hud.textContent = 'HOLLOW KNIGHT — STABILITY FS V5.5\n' + detail;
+        return;
+      }
+
+      installPersistentSaveSync(w);
+
+      let stage = 'Loading…';
+      try {
+        const msg = w.document.getElementById('message');
+        const loading = w.document.getElementById('loading');
+        const canvas = w.document.getElementById('game');
+        if (msg) stage = msg.textContent.trim();
+        else if (canvas && !loading) stage = 'Running';
+      } catch (_) {}
+
+      let jsUsed = null;
+      let jsTotal = null;
+      let jsLimit = null;
+      try {
+        const pm = w.performance && w.performance.memory;
+        if (pm) {
+          jsUsed = pm.usedJSHeapSize;
+          jsTotal = pm.totalJSHeapSize;
+          jsLimit = pm.jsHeapSizeLimit;
+          peakJs = Math.max(peakJs, jsUsed || 0);
+        }
+      } catch (_) {}
+
+      let wasmHeap = null;
+      let wasmUsed = null;
+      try {
+        const inst = w.__hkUnityInstance;
+        const module = inst && inst.Module;
+        if (module && module.HEAPU8 && module.HEAPU8.buffer) {
+          wasmHeap = module.HEAPU8.buffer.byteLength;
+          if (typeof module.__hkDynamicTop === 'function') {
+            wasmUsed = module.__hkDynamicTop();
+            peakWasmUsed = Math.max(peakWasmUsed, wasmUsed || 0);
+          }
+        }
+      } catch (_) {}
+
+      let s = {};
+      try { s = w.__hkLazyStats || {}; } catch (_) {}
+
+      const lines = [
+        'HOLLOW KNIGHT — STABILITY FS V5.5',
+        'FPS          ' + (fps ? fps.toFixed(1) : '—'),
+        jsUsed != null ? 'JS heap      ' + mb(jsUsed) + '  peak ' + mb(peakJs) : 'JS heap      unavailable',
+        jsTotal != null ? 'JS alloc     ' + mb(jsTotal) : null,
+        wasmHeap != null ? 'WASM heap    ' + mb(wasmHeap) : null,
+        wasmUsed != null && wasmHeap != null ? 'WASM used    ' + mb(wasmUsed) + '  peak ' + mb(peakWasmUsed) : null,
+        wasmUsed != null && wasmHeap != null ? 'WASM slack   ' + mb(Math.max(0, wasmHeap - wasmUsed)) : null,
+        wasmUsed != null ? 'Known floor  ' + mb(wasmUsed + (s.cacheBytes || 0)) + '  + GPU/native/JS' : null,
+        jsLimit != null ? 'Heap limit   ' + mb(jsLimit) : null,
+        '',
+        'Stage        ' + stage,
+        'Lazy phase   ' + (s.phase || '—'),
+        'Render DPR   ' + (ACTUAL_IOS ? '0.80' : '1.00'),
+        'Keyboard     ' + (keyboardBridgeInstalled ? 'bridge on' : 'bridge off') + '  fwd ' + keyboardForwarded,
+        'Save hook    ' + (saveSyncInstalled ? 'on' : 'waiting') +
+          (saveSyncInFlight ? '  syncing' : saveDirty ? '  dirty' : '  clean'),
+        saveSyncInstalled ? 'Save flushes ' + saveSyncCount + '  errors ' + saveSyncErrors : null,
+        saveLastSuccess ? 'Last flush   ' + ((performance.now() - saveLastSuccess) / 1000).toFixed(1) + 's ago' : null,
+        saveLastPath ? 'Save path    ' + String(saveLastPath).slice(-80) : null,
+        'Transport    ' + (s.transport || '—'),
+        s.rangeHost ? 'Range host   ' + s.rangeHost : null,
+        s.fallbackReason ? 'Fallback     ' + String(s.fallbackReason).slice(0, 120) : null,
+        'FS files     ' + (s.loadedFiles || 0) + ' / ' + (s.totalFiles || 0) + ' touched',
+        'Data cache   ' + mb(s.cacheBytes || 0) + ' / ' + mb(s.cacheLimit || CACHE_LIMIT_MB * 1048576),
+        'Block size   ' + mb(s.blockSize || 0),
+        'Reads        ' + (s.readCalls || 0) + ', ' + mb(s.readBytes || 0) + '\n' +
+        'MMAP         ' + (s.mmapCalls || 0) + ', ' + mb(s.mmapBytes || 0),
+        'Sync ranges  ' + (s.syncPartLoads || 0) + ', ' + mb(s.syncBytes || 0),
+        'Prefetch     ' + (s.asyncPrefetches || 0) + ', ' + mb(s.asyncPrefetchBytes || 0),
+        'Evictions    ' + (s.evictions || 0),
+        'Open/close   ' + (s.opens || 0) + ' / ' + (s.closes || 0),
+        s.activeFile ? 'Active file  ' + s.activeFile : null,
+        s.activePart ? 'Active part  ' + s.activePart : null,
+        s.lastFile ? 'Last file    ' + s.lastFile : null,
+        s.lastError ? 'ERROR        ' + s.lastError : null
+      ].filter(v => v !== null);
+
+      hud.textContent = lines.join('\n');
+    }, 250);
+
+  } catch (error) {
+    hud.textContent =
+      'HOLLOW KNIGHT — STABILITY FS V5.5\nFAILED\n' +
+      (error && error.message ? error.message : String(error));
+  }
+})();
