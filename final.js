@@ -520,6 +520,54 @@
                             nw.addEventListener('beforeunload',wDelta);
                         },300);
                     }else alert('Pop-up blocked. Please allow pop-ups.');
+                }else if(gd.type==='iframe'){
+                    writeGameOpen=true;
+                    var t0=Date.now(),opener=window;
+                    var isGoogleHost=/(^|\.)google\./i.test(location.hostname);
+                    var hostUrl=isGoogleHost?location.origin+'/':'about:blank';
+                    var nw=window.open(hostUrl,'_blank');
+                    if(nw){
+                        var dw=false;
+                        function wDelta(){if(dw)return;dw=true;try{localStorage.setItem('_gameTimeDelta',JSON.stringify({name:name,ms:Date.now()-t0,ts:Date.now()}));}catch(e){}}
+                        function mountIframeHost(){
+                            try{
+                                if(nw.closed||!nw.document.body)return;
+                                var doc=nw.document;
+                                doc.title=name;
+                                doc.documentElement.style.cssText='margin:0;width:100%;height:100%;overflow:hidden;background:#000;';
+                                doc.body.textContent='';
+                                doc.body.style.cssText='margin:0;width:100%;height:100%;overflow:hidden;background:#000;';
+                                var gameFrame=doc.createElement('iframe');
+                                gameFrame.style.cssText='position:fixed;inset:0;width:100%;height:100%;border:0;background:#000;';
+                                gameFrame.allow='autoplay; fullscreen; gamepad';
+                                gameFrame.allowFullscreen=true;
+                                gameFrame.srcdoc=h;
+                                gameFrame.onload=function(){setTimeout(function(){try{gameFrame.contentWindow.focus();}catch(e){}},100);};
+                                doc.body.appendChild(gameFrame);
+                                var btn=doc.createElement('button');
+                                btn.innerHTML='<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#f4ede4" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg>';
+                                btn.style.cssText='position:fixed;top:1rem;right:1rem;z-index:99999999;background:rgba(244,237,228,.08);color:#f4ede4;border:1px solid rgba(244,237,228,.2);width:40px;height:40px;cursor:pointer;display:grid;place-items:center;backdrop-filter:blur(8px);transition:.15s;padding:0;';
+                                btn.onmouseover=function(){this.style.background='#dc2626';this.style.borderColor='#dc2626';};
+                                btn.onmouseout=function(){this.style.background='rgba(244,237,228,.08)';this.style.borderColor='rgba(244,237,228,.2)';};
+                                btn.onclick=function(){wDelta();try{opener.focus();}catch(e){}nw.close();};
+                                doc.body.appendChild(btn);
+                                nw.addEventListener('beforeunload',wDelta);
+                            }catch(e){}
+                        }
+                        if(hostUrl==='about:blank'){
+                            mountIframeHost();
+                        }else{
+                            (function waitForGoogleHost(){
+                                try{
+                                    if(nw.closed)return;
+                                    if(nw.location.href!=='about:blank'&&nw.document.readyState==='complete'){
+                                        mountIframeHost();return;
+                                    }
+                                }catch(e){}
+                                setTimeout(waitForGoogleHost,25);
+                            })();
+                        }
+                    }else alert('Pop-up blocked. Please allow pop-ups.');
                 }else{
                     curGame=name;curStart=Date.now();
                     document.body.style.overflow='hidden';
