@@ -41,7 +41,7 @@ javascript:(async function () {
     'backdrop-filter:blur(4px)',
     '-webkit-backdrop-filter:blur(4px)'
   ].join(';');
-  hud.textContent = 'HOLLOW KNIGHT — STABILITY FS V5.5\nBootstrapping…';
+  hud.textContent = 'HOLLOW KNIGHT — STABILITY FS V5.6\nBootstrapping…';
 
   root.append(outer, hud);
   document.body.appendChild(root);
@@ -69,7 +69,7 @@ javascript:(async function () {
   let saveLastSuccess = 0;
 
   try {
-    hud.textContent = 'HOLLOW KNIGHT — STABILITY FS V5.5\nFetching 3 small bootstrap files…';
+    hud.textContent = 'HOLLOW KNIGHT — STABILITY FS V5.6\nFetching 3 small bootstrap files…';
 
     const [indexRes, loaderRes, frameworkRes] = await Promise.all([
       fetch(BASE + 'index.html'),
@@ -145,8 +145,11 @@ javascript:(async function () {
   const MAGIC = 'UnityWebData1.0\0';
   const HEADER_PREFIX_SIZE = MAGIC.length + 4;
   const BLOCK_SIZE = 2 * 1024 * 1024;
-  const RANGE_CACHE_LIMIT = 24 * 1024 * 1024;
-  const WHOLE_CACHE_LIMIT = 22 * 1024 * 1024;
+  const RANGE_CACHE_LIMIT = 40 * 1024 * 1024;
+  const WHOLE_CACHE_LIMIT = 42 * 1024 * 1024;
+  const PREFETCH_OPEN_BLOCKS = 3;
+  const PREFETCH_SEQ_BLOCKS = 4;
+  const PREFETCH_COLD_BLOCKS = 1;
 
   const stats = window.__hkLazyStats = {
     phase: 'waiting',
@@ -480,6 +483,7 @@ javascript:(async function () {
     const rangeCache = new Map();
     const prefetching = new Map();
     const wholeCache = new Map();
+    const wholePrefetching = new Map();
 
     stats.phase = 'transport-probe';
     setMessage('Checking iPad-compatible data transport…');
@@ -585,6 +589,10 @@ javascript:(async function () {
       return partIndex + ':' + blockIndex;
     }
 
+    function blockCount(partIndex) {
+      return Math.ceil(partLengths[partIndex] / BLOCK_SIZE);
+    }
+
     function blockBounds(partIndex, blockIndex) {
       const length = partLengths[partIndex];
       const start = blockIndex * BLOCK_SIZE;
@@ -593,12 +601,97 @@ javascript:(async function () {
       return { start, end };
     }
 
-    function getRangeBlock(partIndex, blockIndex) {
+    function advanceBlock(partIndex, blockIndex, steps) {
+      let p = partIndex;
+      let b = blockIndex;
+
+      for (let i = 0; i < steps; i++) {
+        b++;
+        while (p < partLengths.length && b >= blockCount(p)) {
+          p++;
+          b = 0;
+        }
+        if (p >= partLengths.length) return null;
+      }
+
+      return { partIndex: p, blockIndex: b };
+    }
+
+    function archiveBlockLocation(archiveOffset) {
+      const partIndex = Math.floor(archiveOffset / partSize);
+      if (partIndex < 0 || partIndex >= partLengths.length) return null;
+      const offsetInPart = archiveOffset % partSize;
+      return {
+        partIndex,
+        blockIndex: Math.floor(offsetInPart / BLOCK_SIZE)
+      };
+    }
+
+    function storeRangeBlock(partIndex, blockIndex, bytes) {
+      const key = rangeKey(partIndex, blockIndex);
+      const existing = rangeCache.get(key);
+      if (existing) {
+        touch(rangeCache, key, existing);
+        return existing.bytes;
+      }
+
+      const record = { bytes, lastUse: performance.now() };
+      rangeCache.set(key, record);
+      touch(rangeCache, key, record);
+      trim(rangeCache, RANGE_CACHE_LIMIT, key);
+      return bytes;
+    }
+
+    function scheduleRangeBlock(partIndex, blockIndex) {
+      if (partIndex < 0 || partIndex >= partLengths.length) return;
+
+      const key = rangeKey(partIndex, blockIndex);
+      if (rangeCache.has(key) || prefetching.has(key)) return;
+
+      let bounds;
+      try {
+        bounds = blockBounds(partIndex, blockIndex);
+      } catch (_) {
+        return;
+      }
+
+      const p = asyncRange(
+        urls[partIndex],
+        bounds.start,
+        bounds.end,
+        rangeHost
+      ).then(result => {
+        stats.asyncPrefetches++;
+        stats.asyncPrefetchBytes += result.bytes.byteLength;
+        storeRangeBlock(partIndex, blockIndex, result.bytes);
+      }).catch(() => {
+      }).finally(() => {
+        prefetching.delete(key);
+      });
+
+      prefetching.set(key, p);
+    }
+
+    function prefetchRangeAhead(partIndex, blockIndex, count, includeCurrent) {
+      let location = includeCurrent
+        ? { partIndex, blockIndex }
+        : advanceBlock(partIndex, blockIndex, 1);
+
+      for (let i = 0; i < count && location; i++) {
+        scheduleRangeBlock(location.partIndex, location.blockIndex);
+        location = advanceBlock(location.partIndex, location.blockIndex, 1);
+      }
+    }
+
+    function getRangeBlock(partIndex, blockIndex, prefetchAhead) {
       const key = rangeKey(partIndex, blockIndex);
       const cached = rangeCache.get(key);
 
       if (cached) {
         touch(rangeCache, key, cached);
+        if (prefetchAhead > 0) {
+          prefetchRangeAhead(partIndex, blockIndex, prefetchAhead, false);
+        }
         return cached.bytes;
       }
 
@@ -617,68 +710,117 @@ javascript:(async function () {
       stats.syncBytes += bytes.byteLength;
       stats.activePart = '';
 
-      const record = { bytes, lastUse: performance.now() };
-      rangeCache.set(key, record);
-      touch(rangeCache, key, record);
-      trim(rangeCache, RANGE_CACHE_LIMIT, key);
+      storeRangeBlock(partIndex, blockIndex, bytes);
 
-      const nextBlock = blockIndex + 1;
-      const nextStart = nextBlock * BLOCK_SIZE;
-
-      if (nextStart < partLengths[partIndex]) {
-        const nextKey = rangeKey(partIndex, nextBlock);
-
-        if (!rangeCache.has(nextKey) && !prefetching.has(nextKey)) {
-          const nextBounds = blockBounds(partIndex, nextBlock);
-
-          const p = asyncRange(
-            urls[partIndex],
-            nextBounds.start,
-            nextBounds.end,
-            rangeHost
-          ).then(result => {
-            stats.asyncPrefetches++;
-            stats.asyncPrefetchBytes += result.bytes.byteLength;
-
-            if (!rangeCache.has(nextKey)) {
-              const nextRecord = { bytes: result.bytes, lastUse: performance.now() };
-              rangeCache.set(nextKey, nextRecord);
-              touch(rangeCache, nextKey, nextRecord);
-              trim(rangeCache, RANGE_CACHE_LIMIT, nextKey);
-            }
-          }).catch(() => {
-          }).finally(() => {
-            prefetching.delete(nextKey);
-          });
-
-          prefetching.set(nextKey, p);
-        }
+      if (prefetchAhead > 0) {
+        prefetchRangeAhead(partIndex, blockIndex, prefetchAhead, false);
       }
 
       return bytes;
     }
 
-    function getWholePart(partIndex) {
+    function storeWholePart(partIndex, bytes) {
+      const existing = wholeCache.get(partIndex);
+      if (existing) {
+        touch(wholeCache, partIndex, existing);
+        return existing.bytes;
+      }
+
+      const record = { bytes, lastUse: performance.now() };
+      wholeCache.set(partIndex, record);
+      touch(wholeCache, partIndex, record);
+      trim(wholeCache, WHOLE_CACHE_LIMIT, partIndex);
+      return bytes;
+    }
+
+    function scheduleWholePart(partIndex) {
+      if (
+        partIndex < 0 ||
+        partIndex >= urls.length ||
+        wholeCache.has(partIndex) ||
+        wholePrefetching.has(partIndex)
+      ) return;
+
+      const p = fetchBytes(urls[partIndex]).then(bytes => {
+        stats.asyncPrefetches++;
+        stats.asyncPrefetchBytes += bytes.byteLength;
+        storeWholePart(partIndex, bytes);
+      }).catch(() => {
+      }).finally(() => {
+        wholePrefetching.delete(partIndex);
+      });
+
+      wholePrefetching.set(partIndex, p);
+    }
+
+    function getWholePart(partIndex, prefetchNext) {
       const cached = wholeCache.get(partIndex);
 
       if (cached) {
         touch(wholeCache, partIndex, cached);
+        if (prefetchNext && partIndex + 1 < urls.length) {
+          scheduleWholePart(partIndex + 1);
+        }
         return cached.bytes;
       }
 
       const bytes = syncWhole(urls[partIndex]);
-      const record = { bytes, lastUse: performance.now() };
+      storeWholePart(partIndex, bytes);
 
-      wholeCache.set(partIndex, record);
-      touch(wholeCache, partIndex, record);
-      trim(wholeCache, WHOLE_CACHE_LIMIT, partIndex);
+      if (prefetchNext && partIndex + 1 < urls.length) {
+        scheduleWholePart(partIndex + 1);
+      }
 
       return bytes;
+    }
+
+    function warmEntry(entry) {
+      if (!entry || entry.size <= 0) return;
+
+      if (transport === 'range') {
+        if (
+          entry.size >= 4 * 1024 * 1024 ||
+          /\.(resource|resources|unity3d|resS)$/i.test(entry.name)
+        ) {
+          const location = archiveBlockLocation(entry.offset);
+          if (location) {
+            prefetchRangeAhead(
+              location.partIndex,
+              location.blockIndex,
+              PREFETCH_OPEN_BLOCKS,
+              true
+            );
+          }
+        }
+      } else {
+        const partIndex = Math.floor(entry.offset / partSize);
+        scheduleWholePart(partIndex);
+        if (entry.size >= partSize / 2 && partIndex + 1 < urls.length) {
+          scheduleWholePart(partIndex + 1);
+        }
+      }
     }
 
     function readRangeInto(entry, filePosition, length, target, targetOffset) {
       if (length <= 0 || filePosition >= entry.size) return 0;
       if (filePosition < 0) fail('HybridFS: negative file position for ' + entry.name);
+
+      const previousEnd = entry.__hkLastReadEnd;
+      const nearSequential =
+        typeof previousEnd === 'number' &&
+        filePosition >= previousEnd &&
+        filePosition - previousEnd <= BLOCK_SIZE;
+
+      if (nearSequential) {
+        entry.__hkSeqStreak = (entry.__hkSeqStreak || 0) + 1;
+      } else {
+        entry.__hkSeqStreak = 0;
+      }
+
+      const prefetchAhead =
+        entry.__hkSeqStreak >= 2
+          ? PREFETCH_SEQ_BLOCKS
+          : PREFETCH_COLD_BLOCKS;
 
       const wanted = Math.min(length, entry.size - filePosition);
       let archiveOffset = entry.offset + filePosition;
@@ -692,17 +834,21 @@ javascript:(async function () {
         if (transport === 'range') {
           const blockIndex = Math.floor(offsetInPart / BLOCK_SIZE);
           const offsetInBlock = offsetInPart % BLOCK_SIZE;
-          const block = getRangeBlock(partIndex, blockIndex);
+          const block = getRangeBlock(partIndex, blockIndex, prefetchAhead);
           const count = Math.min(remaining, block.byteLength - offsetInBlock);
 
           if (count <= 0) fail('HybridFS: invalid zero-length range read');
 
-          target.set(block.subarray(offsetInBlock, offsetInBlock + count), destination);
+          target.set(
+            block.subarray(offsetInBlock, offsetInBlock + count),
+            destination
+          );
+
           archiveOffset += count;
           destination += count;
           remaining -= count;
         } else {
-          const part = getWholePart(partIndex);
+          const part = getWholePart(partIndex, nearSequential);
 
           if (offsetInPart >= part.byteLength) {
             fail('HybridFS: file points outside part ' + (partIndex + 1));
@@ -710,13 +856,18 @@ javascript:(async function () {
 
           const count = Math.min(remaining, part.byteLength - offsetInPart);
 
-          target.set(part.subarray(offsetInPart, offsetInPart + count), destination);
+          target.set(
+            part.subarray(offsetInPart, offsetInPart + count),
+            destination
+          );
+
           archiveOffset += count;
           destination += count;
           remaining -= count;
         }
       }
 
+      entry.__hkLastReadEnd = filePosition + wanted;
       markTouched(entry);
       return wanted;
     }
@@ -751,6 +902,7 @@ javascript:(async function () {
         node.__hkOpenCount++;
         stats.opens++;
         markTouched(entry);
+        warmEntry(entry);
       };
 
       ops.close = function() {
@@ -1171,7 +1323,7 @@ javascript:(async function () {
             detail = 'Game iframe was detached';
           }
         } catch (_) {}
-        hud.textContent = 'HOLLOW KNIGHT — STABILITY FS V5.5\n' + detail;
+        hud.textContent = 'HOLLOW KNIGHT — STABILITY FS V5.6\n' + detail;
         return;
       }
 
@@ -1217,7 +1369,7 @@ javascript:(async function () {
       try { s = w.__hkLazyStats || {}; } catch (_) {}
 
       const lines = [
-        'HOLLOW KNIGHT — STABILITY FS V5.5',
+        'HOLLOW KNIGHT — STABILITY FS V5.6',
         'FPS          ' + (fps ? fps.toFixed(1) : '—'),
         jsUsed != null ? 'JS heap      ' + mb(jsUsed) + '  peak ' + mb(peakJs) : 'JS heap      unavailable',
         jsTotal != null ? 'JS alloc     ' + mb(jsTotal) : null,
@@ -1242,6 +1394,7 @@ javascript:(async function () {
         'FS files     ' + (s.loadedFiles || 0) + ' / ' + (s.totalFiles || 0) + ' touched',
         'Data cache   ' + mb(s.cacheBytes || 0) + ' / ' + mb(s.cacheLimit || CACHE_LIMIT_MB * 1048576),
         'Block size   ' + mb(s.blockSize || 0),
+        'Prefetch cfg open ' + PREFETCH_OPEN_BLOCKS + '  seq ' + PREFETCH_SEQ_BLOCKS,
         'Reads        ' + (s.readCalls || 0) + ', ' + mb(s.readBytes || 0) + '\n' +
         'MMAP         ' + (s.mmapCalls || 0) + ', ' + mb(s.mmapBytes || 0),
         'Sync ranges  ' + (s.syncPartLoads || 0) + ', ' + mb(s.syncBytes || 0),
@@ -1259,7 +1412,7 @@ javascript:(async function () {
 
   } catch (error) {
     hud.textContent =
-      'HOLLOW KNIGHT — STABILITY FS V5.5\nFAILED\n' +
+      'HOLLOW KNIGHT — STABILITY FS V5.6\nFAILED\n' +
       (error && error.message ? error.message : String(error));
   }
 })();
