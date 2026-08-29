@@ -29,7 +29,7 @@
         '.lt em{font-style:italic;font-weight:500;color:#ea580c;}'+
         '.ls{color:#a8a29e;font-size:.82rem;margin-bottom:2rem;}'+
         '.lflabel{font-size:.65rem;letter-spacing:.2em;text-transform:uppercase;color:#a8a29e;margin-bottom:.55rem;display:flex;justify-content:space-between;}'+
-        '.lflabel .num{color:#ea580c;}'+
+        '.lflabel .num{color:#ea580c;}'+'.lmk{display:inline-flex;align-items:center;color:#ea580c;margin-right:.35rem;vertical-align:middle;transform:translateY(-1px);}'+'.lmk svg{width:12px;height:12px;display:block;}'+
         '.lf{position:relative;margin-bottom:1.1rem;}'+
         '.lf input{display:block;width:100%;padding:.85rem 2.6rem .85rem 1rem;background:#0c0a09;color:#f4ede4;border:1px solid #44403c;font-size:.9rem;outline:none;transition:border-color .15s;line-height:1.4;border-radius:0;-webkit-appearance:none;appearance:none;}'+
         '.lf input:focus{border-color:#ea580c;}'+
@@ -51,9 +51,9 @@
             '<div class="llabel">Authentication</div>'+
             '<div class="lt">Welcome to the <em>library</em>.</div>'+
             '<div class="ls">Enter your credentials to continue.</div>'+
-            '<div class="lflabel"><span><span class="num">§</span> Username</span><span>01</span></div>'+
+            '<div class="lflabel"><span><span class="lmk"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></span> Username</span><span>01</span></div>'+
             '<div class="lf"><input id="u" type="text" placeholder="username" autocomplete="off" spellcheck="false"><span class="lico"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/></svg></span></div>'+
-            '<div class="lflabel"><span><span class="num">§</span> Password</span><span>02</span></div>'+
+            '<div class="lflabel"><span><span class="lmk"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="0"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></span> Password</span><span>02</span></div>'+
             '<div class="lf"><input id="p" type="password" placeholder="\u2022\u2022\u2022\u2022\u2022\u2022\u2022\u2022"><span class="lico" id="eyeBtn"><svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></span></div>'+
             '<button id="lBtn"><span id="lBtnTxt">Sign In</span><div class="lsp" id="lSpin"></div></button>'+
             '<div id="lMsg">\u26A0 Invalid credentials.</div>'+
@@ -114,6 +114,9 @@
         var icoPlay='<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="currentColor"><polygon points="6,4 6,20 20,12"/></svg>';
         var icoImg='<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="0"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/></svg>';
         var icoSearch='<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>';
+        var icoActivity='<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>';
+        var icoChart='<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/></svg>';
+        var icoTrophy='<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6"/><path d="M18 9h1.5a2.5 2.5 0 0 0 0-5H18"/><path d="M4 22h16"/><path d="M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22"/><path d="M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22"/><path d="M18 2H6v7a6 6 0 0 0 12 0V2z"/></svg>';
 
         function gAch(){var s=gSt(),tot=totT(),fv=gFv(),rc=gRc();return[
             {icon:icoController,name:'First Launch',desc:'Opened your first game',u:rc.length>=1},
@@ -205,6 +208,8 @@
         document.write('#favSec,#recSec,#allSec{display:none;margin-bottom:3rem;}');
         document.write('.slbl{font-size:.62rem;font-weight:600;text-transform:uppercase;color:var(--ink-dim);letter-spacing:.25em;margin-bottom:1.25rem;display:flex;justify-content:space-between;align-items:baseline;padding-bottom:.75rem;border-bottom:1px solid var(--line);}');
         document.write('.slbl .accent{color:var(--accent);}');
+        document.write('.lmk{display:inline-flex;align-items:center;color:var(--accent);margin-right:.35rem;vertical-align:middle;transform:translateY(-1px);}');
+        document.write('.lmk svg{width:12px;height:12px;display:block;}');
         document.write('.slbl .scount{font-family:var(--mono);font-size:.62rem;color:var(--ink-dim);}');
 
         // Game grid
@@ -345,14 +350,14 @@
 
         // Search
         document.write('<section class="sw-block">');
-        document.write('<div class="sw-label"><span><span class="num">§</span> Search</span><span>Type to filter your library</span></div>');
+        document.write('<div class="sw-label"><span><span class="lmk">'+icoSearch+'</span> Search</span><span>Type to filter your library</span></div>');
         document.write('<div class="sw"><span class="sb-icon">'+icoSearch+'</span><input type="text" id="sb" class="sbar" placeholder="Search games..." autocomplete="off" spellcheck="false"><button class="sclr" id="sc">'+icoX+'</button></div>');
         document.write('</section>');
 
         // Sections
-        document.write('<section id="favSec"><div class="slbl"><span><span class="accent">§</span> Favorites</span><span class="scount" id="favCount"></span></div><div id="favGrid"></div></section>');
-        document.write('<section id="recSec"><div class="slbl"><span><span class="accent">§</span> Recently Played</span><span class="scount" id="recCount"></span></div><div id="recGrid"></div></section>');
-        document.write('<section id="allSec"><div class="slbl"><span><span class="accent">§</span> All Games</span><span class="scount" id="allCount"></span></div><div id="list"></div></section>');
+        document.write('<section id="favSec"><div class="slbl"><span><span class="lmk">'+icoHeart+'</span> Favorites</span><span class="scount" id="favCount"></span></div><div id="favGrid"></div></section>');
+        document.write('<section id="recSec"><div class="slbl"><span><span class="lmk">'+icoClock+'</span> Recently Played</span><span class="scount" id="recCount"></span></div><div id="recGrid"></div></section>');
+        document.write('<section id="allSec"><div class="slbl"><span><span class="lmk">'+icoController+'</span> All Games</span><span class="scount" id="allCount"></span></div><div id="list"></div></section>');
 
         document.write('<div id="noRes"><div class="nr-title">Nothing found.</div><div class="nr-sub">Try a different query.</div></div>');
 
@@ -364,14 +369,14 @@
         // Profile panel
         document.write('<div id="pOv"></div><div id="pPanel">');
         document.write('<div class="ph"><button class="phClose" id="phClose">'+icoXLg+'</button>');
-        document.write('<div class="phLabel">&sect; User Profile</div>');
+        document.write('<div class="phLabel"><span class="lmk">'+icoUser+'</span>User Profile</div>');
         document.write('<div class="phRow"><div class="phAv" id="phAv"></div><div><div class="phName" id="phName"></div><div class="phSub" id="phSub"></div></div></div></div>');
-        document.write('<div class="ps"><div class="pst"><span><span class="accent">&sect;</span> Appearance</span><span>01</span></div><div class="trow"><button class="tbtn" data-theme="dark">Dark</button><button class="tbtn" data-theme="light">Light</button></div></div>');
-        document.write('<div class="ps"><div class="pst"><span><span class="accent">&sect;</span> Stats</span><span>02</span></div><div class="sg" id="sg"></div></div>');
-        document.write('<div class="ps"><div class="pst"><span><span class="accent">&sect;</span> Playtime Breakdown</span><span>03</span></div><div id="ptList"></div></div>');
-        document.write('<div class="ps"><div class="pst"><span><span class="accent">&sect;</span> Favorites</span><span>04</span></div><div id="pFavs"></div></div>');
-        document.write('<div class="ps"><div class="pst"><span><span class="accent">&sect;</span> Recently Played</span><span>05</span></div><div id="pRecent"></div></div>');
-        document.write('<div class="ps"><div class="pst"><span><span class="accent">&sect;</span> Achievements</span><span>06</span></div><div id="pAch"></div></div>');
+        document.write('<div class="ps"><div class="pst"><span><span class="lmk">'+icoMoon+'</span> Appearance</span><span>01</span></div><div class="trow"><button class="tbtn" data-theme="dark">Dark</button><button class="tbtn" data-theme="light">Light</button></div></div>');
+        document.write('<div class="ps"><div class="pst"><span><span class="lmk">'+icoActivity+'</span> Stats</span><span>02</span></div><div class="sg" id="sg"></div></div>');
+        document.write('<div class="ps"><div class="pst"><span><span class="lmk">'+icoChart+'</span> Playtime Breakdown</span><span>03</span></div><div id="ptList"></div></div>');
+        document.write('<div class="ps"><div class="pst"><span><span class="lmk">'+icoHeart+'</span> Favorites</span><span>04</span></div><div id="pFavs"></div></div>');
+        document.write('<div class="ps"><div class="pst"><span><span class="lmk">'+icoClock+'</span> Recently Played</span><span>05</span></div><div id="pRecent"></div></div>');
+        document.write('<div class="ps"><div class="pst"><span><span class="lmk">'+icoTrophy+'</span> Achievements</span><span>06</span></div><div id="pAch"></div></div>');
         document.write('</div>');
 
         // Game overlay
