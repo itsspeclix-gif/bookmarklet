@@ -2,6 +2,7 @@ javascript:(async function () {
   'use strict';
 
   const ROOT_ID = '__buckshot_lazy_debug__';
+  const TEST_STARTED_AT = Date.now();
 
   const previous = document.getElementById(ROOT_ID);
   if (previous) {
@@ -40,9 +41,20 @@ javascript:(async function () {
     20276800
   ];
 
-  const BLOCK_SIZE = 2 * 1024 * 1024;
+  const BLOCK_SIZE = 4 * 1024 * 1024;
   const CACHE_LIMIT = 60 * 1024 * 1024;
   const MAX_CACHE_BLOCKS = Math.floor(CACHE_LIMIT / BLOCK_SIZE);
+  const TOTAL_RANGE_BLOCKS = Math.ceil(PCK_SIZE / BLOCK_SIZE);
+
+  // Protect a very small set of genuinely hot PCK units while leaving most
+  // of the cache available to normal LRU replacement.
+  const HOT_PIN_COUNT = 3;
+  const HOT_MIN_ACCESSES = 16;
+
+  // One demand read can queue a couple of neighboring blocks asynchronously.
+  // This never increases the 60 MiB resident cache ceiling.
+  const PREFETCH_AHEAD = 2;
+  const MAX_PREFETCH_INFLIGHT = 2;
 
   const PART_STARTS = [];
   let runningPartOffset = 0;
@@ -103,7 +115,7 @@ javascript:(async function () {
   ].join(';');
 
   hud.textContent =
-    'BUCKSHOT ROULETTE — LAZY PCK DEBUG V3\n' +
+    'BUCKSHOT ROULETTE — LAZY PCK DEBUG V4\n' +
     'Bootstrapping…';
 
   root.append(frame, hud);
@@ -193,7 +205,7 @@ javascript:(async function () {
       '<meta charset="utf-8">' +
       '<meta name="viewport" ' +
       'content="width=device-width,user-scalable=no,initial-scale=1.0">' +
-      '<title>Buckshot Roulette — Lazy PCK Debug</title>' +
+      '<title>Buckshot Roulette — Lazy PCK Debug V4</title>' +
       '<link rel="stylesheet" href="' +
       BASE +
       'style.css">' +
@@ -292,6 +304,13 @@ javascript:(async function () {
       misses: 0,
       evictions: 0,
 
+      uniqueRequested: 0,
+      uniqueMisses: 0,
+      refetchMisses: 0,
+      refetchAfterEviction: 0,
+      hotPinned: 0,
+      hotSummary: '—',
+
       readCalls: 0,
       readBytes: 0,
 
@@ -301,6 +320,8 @@ javascript:(async function () {
 
       syncRangeRequests: 0,
       syncBytes: 0,
+      syncFetchMs: 0,
+      syncFetchMaxMs: 0,
 
       asyncRangeRequests: 0,
       asyncBytes: 0,
@@ -330,6 +351,8 @@ javascript:(async function () {
       jsDeltaPeak: 0,
       ramEstimateNow: 0,
       ramEstimatePeak: 0,
+
+      timeToRunningMs: 0,
 
       failures: 0,
       lastError: ''
@@ -558,7 +581,7 @@ javascript:(async function () {
               : MAX_CACHE_BLOCKS;
 
           const lines = [
-            'BUCKSHOT ROULETTE — LAZY PCK DEBUG V3',
+            'BUCKSHOT ROULETTE — LAZY PCK DEBUG V4',
             '',
             'Stage          ' + stats.stage,
             'FPS            ' +
@@ -567,6 +590,23 @@ javascript:(async function () {
                   ? fps.toFixed(1)
                   : '—'
               ),
+            stats.timeToRunningMs
+              ? (
+                  'Time to run    ' +
+                  (
+                    stats.timeToRunningMs /
+                    1000
+                  ).toFixed(1) +
+                  ' s'
+                )
+              : (
+                  'Boot elapsed   ' +
+                  (
+                    (Date.now() - TEST_STARTED_AT) /
+                    1000
+                  ).toFixed(1) +
+                  ' s'
+                ),
             '',
             'RAM EST NOW    ' +
               mb(stats.ramEstimateNow),
@@ -637,7 +677,22 @@ javascript:(async function () {
             'Cache hits     ' + stats.hits,
             'Cache misses   ' + stats.misses,
             'Hit rate       ' + hitRate,
+            'Unique units   ' +
+              stats.uniqueRequested +
+              (
+                stats.transport === 'range'
+                  ? ' / ' + TOTAL_RANGE_BLOCKS
+                  : ' / ' + PART_SIZES.length
+              ),
+            'Unique misses  ' + stats.uniqueMisses,
+            'Refetch misses ' + stats.refetchMisses,
+            'After eviction ' + stats.refetchAfterEviction,
             'Evictions      ' + stats.evictions,
+            'Hot pinned     ' +
+              stats.hotPinned +
+              ' / ' +
+              HOT_PIN_COUNT,
+            'Hot units      ' + stats.hotSummary,
             '',
             'Read calls     ' + stats.readCalls,
             'Read bytes     ' + mb(stats.readBytes),
@@ -646,6 +701,25 @@ javascript:(async function () {
               stats.syncRangeRequests +
               ' / ' +
               mb(stats.syncBytes),
+            'Sync blocked   ' +
+              (
+                stats.syncFetchMs /
+                1000
+              ).toFixed(1) +
+              ' s',
+            'Sync avg       ' +
+              (
+                stats.syncRangeRequests
+                  ? (
+                      stats.syncFetchMs /
+                      stats.syncRangeRequests
+                    ).toFixed(0)
+                  : '0'
+              ) +
+              ' ms',
+            'Sync max       ' +
+              stats.syncFetchMaxMs.toFixed(0) +
+              ' ms',
             'Prefetches     ' +
               stats.prefetches +
               '  failures ' +
@@ -708,7 +782,7 @@ javascript:(async function () {
             lines.join('\n');
         } catch (error) {
           hud.textContent =
-            'BUCKSHOT ROULETTE — LAZY PCK DEBUG V3\n\n' +
+            'BUCKSHOT ROULETTE — LAZY PCK DEBUG V4\n\n' +
             'HUD error: ' +
             errorText(error);
         }
@@ -815,11 +889,11 @@ javascript:(async function () {
     );
 
     const candidateBases = [
-      BASE,
       BASE.replace(
         'cdn.jsdelivr.net',
         'fastly.jsdelivr.net'
-      )
+      ),
+      BASE
     ];
 
     const probeErrors = [];
@@ -844,7 +918,7 @@ javascript:(async function () {
     if (rangeSucceeded) {
       transport = 'range';
       stats.transport = 'range';
-      stats.cacheUnit = '2 MiB blocks';
+      stats.cacheUnit = '4 MiB blocks';
       stats.rangeProbe =
         'sync HTTP 206 confirmed';
       stats.rangeHost =
@@ -1077,8 +1151,16 @@ javascript:(async function () {
     }
 
     const cache = new Map();
-    let prefetchPromise = null;
-    let prefetchIndex = null;
+
+    // Diagnostics / policy state.
+    const accessCounts = new Map();
+    const requestedUnits = new Set();
+    const missedUnits = new Set();
+    const evictedUnits = new Set();
+
+    // Multiple lightweight prefetches can be active at once. Demand reads
+    // remain synchronous because Godot's FS read callback is synchronous.
+    const prefetchInFlight = new Map();
 
     function findPartIndex(logicalOffset) {
       for (
@@ -1201,6 +1283,9 @@ javascript:(async function () {
         'buckshot-roulette.pck.part' +
         segment.part;
 
+      const syncStarted =
+        gameWindow.performance.now();
+
       const xhr =
         new gameWindow.XMLHttpRequest();
 
@@ -1295,6 +1380,19 @@ javascript:(async function () {
       stats.fetchedBytes +=
         bytes.byteLength;
 
+      const syncElapsed =
+        gameWindow.performance.now() -
+        syncStarted;
+
+      stats.syncFetchMs +=
+        syncElapsed;
+
+      stats.syncFetchMaxMs =
+        Math.max(
+          stats.syncFetchMaxMs,
+          syncElapsed
+        );
+
       return bytes;
     }
 
@@ -1385,6 +1483,9 @@ javascript:(async function () {
         'buckshot-roulette.pck.part' +
         part;
 
+      const syncStarted =
+        gameWindow.performance.now();
+
       const xhr =
         new gameWindow.XMLHttpRequest();
 
@@ -1454,6 +1555,19 @@ javascript:(async function () {
 
       stats.fetchedBytes +=
         bytes.byteLength;
+
+      const syncElapsed =
+        gameWindow.performance.now() -
+        syncStarted;
+
+      stats.syncFetchMs +=
+        syncElapsed;
+
+      stats.syncFetchMaxMs =
+        Math.max(
+          stats.syncFetchMaxMs,
+          syncElapsed
+        );
 
       return bytes;
     }
@@ -1556,6 +1670,92 @@ javascript:(async function () {
       );
     }
 
+    function getHotPinnedSet() {
+      const ranked = [];
+
+      for (const index of cache.keys()) {
+        const count =
+          accessCounts.get(index) || 0;
+
+        if (count >= HOT_MIN_ACCESSES) {
+          ranked.push({
+            index,
+            count
+          });
+        }
+      }
+
+      ranked.sort(
+        (a, b) =>
+          b.count - a.count ||
+          a.index - b.index
+      );
+
+      const pinned =
+        new Set(
+          ranked
+            .slice(0, HOT_PIN_COUNT)
+            .map((entry) => entry.index)
+        );
+
+      stats.hotPinned = pinned.size;
+
+      stats.hotSummary =
+        ranked.length
+          ? ranked
+              .slice(0, 5)
+              .map(
+                (entry) =>
+                  '#' +
+                  entry.index +
+                  ':' +
+                  entry.count
+              )
+              .join(' ')
+          : '—';
+
+      return pinned;
+    }
+
+    function chooseEvictionCandidate() {
+      const pinned =
+        getHotPinnedSet();
+
+      // Map iteration order is LRU order because touchUnit() moves a unit to
+      // the end. Prefer the oldest non-hot unit.
+      for (const index of cache.keys()) {
+        if (!pinned.has(index)) {
+          return index;
+        }
+      }
+
+      // This should only happen when the cache is tiny and every resident
+      // unit is one of the protected hot set.
+      return cache.keys().next().value;
+    }
+
+    function evictOne() {
+      if (!cache.size) {
+        return false;
+      }
+
+      const index =
+        chooseEvictionCandidate();
+
+      const evicted =
+        cache.get(index);
+
+      cache.delete(index);
+
+      stats.cacheBytes -=
+        evicted.byteLength;
+
+      stats.evictions++;
+      evictedUnits.add(index);
+
+      return true;
+    }
+
     function putUnit(index, bytes) {
       if (cache.has(index)) {
         const existing =
@@ -1565,6 +1765,19 @@ javascript:(async function () {
           existing.byteLength;
 
         cache.delete(index);
+      }
+
+      // Evict BEFORE insertion so the resident cache itself never exceeds
+      // the configured 60 MiB ceiling.
+      while (
+        stats.cacheBytes +
+          bytes.byteLength >
+        CACHE_LIMIT &&
+        cache.size > 0
+      ) {
+        if (!evictOne()) {
+          break;
+        }
       }
 
       cache.set(
@@ -1587,27 +1800,10 @@ javascript:(async function () {
           cache.size
         );
 
-      while (
-        stats.cacheBytes >
-        CACHE_LIMIT &&
-        cache.size > 1
-      ) {
-        const oldest =
-          cache.keys().next().value;
-
-        const evicted =
-          cache.get(oldest);
-
-        cache.delete(oldest);
-
-        stats.cacheBytes -=
-          evicted.byteLength;
-
-        stats.evictions++;
-      }
-
       stats.cacheBlocks =
         cache.size;
+
+      getHotPinnedSet();
     }
 
     function touchUnit(index) {
@@ -1713,20 +1909,18 @@ javascript:(async function () {
     function prefetch(index) {
       if (
         !validUnit(index) ||
-        cache.has(index)
+        cache.has(index) ||
+        prefetchInFlight.has(index) ||
+        prefetchInFlight.size >=
+          MAX_PREFETCH_INFLIGHT
       ) {
         return;
       }
 
-      if (prefetchPromise !== null) {
-        return;
-      }
-
-      prefetchIndex = index;
-      stats.prefetchBlock = index;
       stats.prefetches++;
+      stats.prefetchBlock = index;
 
-      prefetchPromise =
+      const promise =
         loadUnitAsync(index)
           .then((unit) => {
             if (!cache.has(index)) {
@@ -1742,13 +1936,58 @@ javascript:(async function () {
               errorText(error);
           })
           .finally(() => {
-            prefetchPromise = null;
-            prefetchIndex = null;
-            stats.prefetchBlock = null;
+            prefetchInFlight.delete(index);
+
+            if (
+              stats.prefetchBlock ===
+              index
+            ) {
+              const remaining =
+                prefetchInFlight.keys()
+                  .next();
+
+              stats.prefetchBlock =
+                remaining.done
+                  ? null
+                  : remaining.value;
+            }
           });
+
+      prefetchInFlight.set(
+        index,
+        promise
+      );
+    }
+
+    function prefetchAhead(index) {
+      for (
+        let step = 1;
+        step <= PREFETCH_AHEAD;
+        step++
+      ) {
+        prefetch(index + step);
+      }
+    }
+
+    function recordUnitAccess(index) {
+      const count =
+        (accessCounts.get(index) || 0) +
+        1;
+
+      accessCounts.set(
+        index,
+        count
+      );
+
+      requestedUnits.add(index);
+
+      stats.uniqueRequested =
+        requestedUnits.size;
     }
 
     function getUnit(index) {
+      recordUnitAccess(index);
+
       if (cache.has(index)) {
         stats.hits++;
 
@@ -1757,12 +1996,24 @@ javascript:(async function () {
 
         stats.lastBlock = index;
 
-        prefetch(index + 1);
+        prefetchAhead(index);
 
         return unit;
       }
 
       stats.misses++;
+
+      if (missedUnits.has(index)) {
+        stats.refetchMisses++;
+      } else {
+        missedUnits.add(index);
+        stats.uniqueMisses++;
+      }
+
+      if (evictedUnits.has(index)) {
+        stats.refetchAfterEviction++;
+      }
+
       stats.activeBlock = index;
 
       let unit;
@@ -1781,7 +2032,7 @@ javascript:(async function () {
         stats.activeBlock = null;
       }
 
-      prefetch(index + 1);
+      prefetchAhead(index);
 
       return unit;
     }
@@ -2002,7 +2253,7 @@ javascript:(async function () {
       (
         transport === 'part'
           ? 'Priming first physical PCK part…\n'
-          : 'Priming first 2 MiB PCK block…\n'
+          : 'Priming first 8 MiB of the PCK…\n'
       ) +
       'Cache cap: 60 MiB'
     );
@@ -2027,15 +2278,26 @@ javascript:(async function () {
 
       prefetch(3);
     } else {
-      const firstUnit =
-        await loadUnitAsync(0);
+      // Seed the first 8 MiB asynchronously before handing control to Godot.
+      // This replaces two likely blocking startup misses with parallel fetches.
+      const firstUnits =
+        await Promise.all([
+          loadUnitAsync(0),
+          loadUnitAsync(1)
+        ]);
 
       putUnit(
         0,
-        firstUnit
+        firstUnits[0]
       );
 
-      prefetch(1);
+      putUnit(
+        1,
+        firstUnits[1]
+      );
+
+      prefetch(2);
+      prefetch(3);
     }
 
     stats.stage = 'starting Godot';
@@ -2114,6 +2376,10 @@ javascript:(async function () {
       statusOverlay.remove();
     }
 
+    stats.timeToRunningMs =
+      Date.now() -
+      TEST_STARTED_AT;
+
     stats.stage = 'Running';
 
   } catch (error) {
@@ -2143,7 +2409,7 @@ javascript:(async function () {
     showFatalError(message);
 
     hud.textContent =
-      'BUCKSHOT ROULETTE — LAZY PCK DEBUG V3\n\n' +
+      'BUCKSHOT ROULETTE — LAZY PCK DEBUG V4\n\n' +
       'FAILED\n' +
       message +
       '\n\n' +
