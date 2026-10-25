@@ -1,0 +1,2434 @@
+/*
+ * GAME LIBRARY v8.2 — READABLE JAVASCRIPT SOURCE
+ * ==========================================================================
+ *  Edit this file; BOOKMARKLET.txt is the same code packed into a bookmark.
+ *
+ *  Map of this file
+ *  ----------------
+ *   BACKEND  §1   Core auth client — Google Form transport, signed replies,
+ *                 saved session, heartbeat. No UI in here.
+ *   APP      §2   Config — backend ids, timings, storage keys, deny codes
+ *   UI       §3   Icons — shared line icons
+ *   UI       §4   Theme — all copy, CSS and markup in one place
+ *                 (restyle the library here without touching the logic)
+ *   UI       §5   UI kit — shadow screens, dialogs, toasts, pop-out helpers
+ *   SCREEN   §6   Sign-in — login form, restoring screen
+ *   SCREEN   §7   Library — local data, page, profile panel, game grid
+ *   LOGIC    §8   Access control — bans, revocations, reconnects, sign-out
+ *   LOGIC    §9   Game loader — download cache, overlay, pop-out windows
+ *   LOGIC    §10  Library startup — heartbeat, focus and storage listeners
+ *   BOOT     §11  What happens when the bookmark is clicked
+ *
+ *  Compatibility: backend config v6 and all localStorage keys are unchanged
+ *  from v8.1, so sessions, stats, favorites and avatars carry over. Clicking
+ *  this bookmark on a page where the old v8.1 library is open swaps it for
+ *  this version without signing in again.
+ *  Ban notices still read "Account banned" and never offer a retry button.
+ * ==========================================================================
+ */
+/* ##########################################################################
+ * §1  CORE BACKEND · BOOKMARKLET FORMS AUTH CLIENT
+ * ##########################################################################
+ *  How sign-in works (unchanged from v8.1, compatible with the v6 backend):
+ *
+ *    browser ──POST──▶ Google Form  (request id + JSON payload)
+ *                         │
+ *                    Apps Script  (checks Accounts sheet, writes reply)
+ *                         │
+ *    browser ◀──read── Response sheet (gviz JSONP query + CSV export, raced)
+ *
+ *  Every reply is HMAC-signed with a one-time secret that only this request
+ *  knew, so a reply cannot be forged, replayed, or mixed up with another one.
+ *
+ *  Exposes: window.BookmarkletFormsAuth  (used by the app layer below)
+ *  Nothing in this section touches the page UI.
+ * ########################################################################## */
+(function (global) {
+    'use strict';
+    const BUILD = '8.2';
+
+    /* ---- 1a. Small helpers: base64url, random ids, CSV parser ------------- */
+    function b64(bytes) {
+        let s = '';
+        for (const b of bytes)
+            s += String.fromCharCode(b);
+        return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+    function unb64(s) {
+        const t = s.replace(/-/g, '+').replace(/_/g, '/');
+        return Uint8Array.from(atob(t + '='.repeat((4 - t.length % 4) % 4)), c => c.charCodeAt(0));
+    }
+    function randomKey() {
+        return b64(global.crypto.getRandomValues(new Uint8Array(32)));
+    }
+    function randomId() {
+        return Array.from(global.crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
+    }
+    function number(x, d, min, max) {
+        x = Number(x);
+        return Number.isFinite(x) ? Math.max(min, Math.min(max, x)) : d;
+    }
+    function clock() {
+        return global.performance && typeof global.performance.now === 'function' ? global.performance.now() : Date.now();
+    }
+    function parseCSV(text) {
+        text = text.replace(/^\uFEFF/, '');
+        const rows = [];
+        let row = [], cell = '', quoted = false;
+        for (let i = 0; i < text.length; i++) {
+            const c = text[i];
+            if (c === '"') {
+                if (quoted && text[i + 1] === '"') {
+                    cell += '"';
+                    i++;
+                }
+                else
+                    quoted = !quoted;
+            }
+            else if (c === ',' && !quoted) {
+                row.push(cell);
+                cell = '';
+            }
+            else if ((c === '\r' || c === '\n') && !quoted) {
+                if (c === '\r' && text[i + 1] === '\n')
+                    i++;
+                row.push(cell);
+                rows.push(row);
+                row = [];
+                cell = '';
+            }
+            else
+                cell += c;
+        }
+        if (quoted)
+            throw new Error('Invalid CSV response.');
+        if (cell || row.length) {
+            row.push(cell);
+            rows.push(row);
+        }
+        return rows;
+    }
+    /* ---- 1b. Error type + human-readable messages for every server code --- */
+    class AuthError extends Error {
+        constructor(code, message) {
+            super(message || code);
+            this.name = 'AuthError';
+            this.code = code;
+        }
+    }
+    const messages = {
+        INVALID_CREDENTIALS: 'Incorrect username or password.',
+        PASSWORD_NOT_SET: 'This account has no password in Accounts column E.',
+        DUPLICATE_USERNAME: 'This username occurs more than once in Accounts. Remove the duplicate row.',
+        ACCOUNT_BANNED: 'This account is banned.',
+        ACCOUNT_DISABLED: 'This account is disabled.',
+        INVALID_PROTECTION_SETTING: 'The protection column has an unsupported value.',
+        INVALID_ORIGIN: 'Run this bookmark on a normal HTTPS website, not the downloaded builder, a new tab, or about:blank.',
+        BROWSER_LOCKED: 'This account is locked to another browser/site. Ask the owner to reset its browser lock.',
+        SESSION_REVOKED: 'Your session was revoked. Sign in again.',
+        INVALID_SESSION: 'Your saved session is missing or expired.',
+        RATE_LIMITED: 'Too many failed attempts. Try again after the configured login window.',
+        STALE_REQUEST: 'The request was delayed or the device clock is incorrect. Try again.',
+        SERVER_ERROR: 'The backend failed. Check Apps Script Executions.',
+        TIMEOUT: 'The check timed out. No verified reply was accepted.',
+        TRANSPORT_ERROR: 'The reply sheet could not be read from this page. A page policy, browser/network restriction, or sharing setting may be blocking it.',
+        INVALID_REPLY: 'The reply is malformed, stale, for another request, or has an invalid signature.',
+        CANCELLED: 'Check cancelled. A submission already received by Google may still be processed.'
+    };
+    function failure(code, detail) {
+        return new AuthError(code, detail || messages[code]);
+    }
+    /* ---- 1c. The client --------------------------------------------------- */
+    class BookmarkletFormsAuth {
+        /* Validates the page (HTTPS only) and the backend config. */
+        constructor(config) {
+            if (!global.crypto || !global.crypto.subtle)
+                throw failure('HTTPS_REQUIRED', 'Use a normal HTTPS website.');
+            const loc = global.location;
+            if (!loc || (loc.protocol && loc.protocol !== 'https:') ||
+                typeof loc.origin !== 'string' || !/^https:\/\/[a-z0-9.-]+(?::[0-9]{1,5})?$/i.test(loc.origin) || loc.origin.length > 250)
+                throw failure('INVALID_ORIGIN');
+            if (!config || config.version !== 6 || !/^https:\/\/docs\.google\.com\/forms\/d\/(?:e\/)?[A-Za-z0-9_-]+\/formResponse$/.test(config.formPostUrl))
+                throw failure('BAD_CONFIG', 'Use the configuration from Setup!B5.');
+            if (!config.fields || !/^entry\.\d+$/.test(config.fields.requestId) || !/^entry\.\d+$/.test(config.fields.payload) ||
+                !/^[A-Za-z0-9_-]+$/.test(config.responsesId) || !Number.isInteger(config.responsesGid) || config.responsesGid < 0)
+                throw failure('BAD_CONFIG', 'Invalid Form field or response-sheet configuration.');
+            this.config = Object.assign({}, config, {
+                timeoutMs: number(config.timeoutMs, 45000, 10000, 120000),
+                pollMs: number(config.pollMs, 750, 250, 5000)
+            });
+            this.origin = loc.origin;
+            this.sessionName = 'bookmarkletFormsSessionV6:' + config.responsesId;
+            this.keyPrefix = 'bookmarkletFormsBrowserV6:' + config.responsesId + ':';
+            this.queue = Promise.resolve();
+            this.generation = 0;
+            this.active = null;
+            this.timer = null;
+            this.options = { heartbeatSeconds: 60, checkBeforeLaunch: false };
+            this.checkJob = null;
+            this.onProgress = null;
+        }
+        /* -- Local storage: saved session + per-user browser key -------------- */
+        get storage() {
+            try {
+                return global.localStorage;
+            }
+            catch (_) {
+                throw failure('STORAGE_ERROR', 'Browser storage is blocked on this site.');
+            }
+        }
+        _serial(fn) {
+            const generation = this.generation;
+            const job = this.queue.catch(() => {
+            }).then(() => {
+                if (generation !== this.generation)
+                    throw failure('CANCELLED');
+                return fn();
+            });
+            this.queue = job;
+            return job;
+        }
+        _saved() {
+            try {
+                return JSON.parse(this.storage.getItem(this.sessionName) || 'null');
+            }
+            catch (_) {
+                return null;
+            }
+        }
+        _browserKey(user, create = true) {
+            const name = this.keyPrefix + encodeURIComponent(user.trim().toLowerCase());
+            let value = this.storage.getItem(name);
+            if (!/^[A-Za-z0-9_-]{43}$/.test(value || '')) {
+                if (!create)
+                    return '';
+                value = randomKey();
+                this.storage.setItem(name, value);
+                if (this.storage.getItem(name) !== value)
+                    throw failure('STORAGE_ERROR', 'Browser storage is unavailable.');
+            }
+            return value;
+        }
+        /* -- Request plumbing: serial queue, cancellation, progress, timeouts - */
+        cancelPendingRequests() {
+            this.generation++;
+            if (this.active)
+                this.active.cancel();
+        }
+        _progress(s, phase, detail) {
+            if (s.closed)
+                return;
+            s.phase = phase;
+            if (typeof this.onProgress === 'function') {
+                try {
+                    this.onProgress({ build: BUILD, id: s.id, phase, detail: detail || '', elapsedMs: clock() - s.start });
+                }
+                catch (_) {
+                }
+            }
+        }
+        // Settles even when a page-wrapped fetch ignores AbortController.
+        _bounded(s, make, ms, cleanup) {
+            return new Promise((resolve, reject) => {
+                let done = false, timer;
+                const finish = (err, value) => {
+                    if (done)
+                        return;
+                    done = true;
+                    clearTimeout(timer);
+                    s.pending.delete(cancel);
+                    try {
+                        if (cleanup)
+                            cleanup();
+                    }
+                    catch (_) {
+                    }
+                    if (err)
+                        reject(err);
+                    else
+                        resolve(value);
+                };
+                const cancel = () => finish(failure('CANCELLED'));
+                if (s.closed) {
+                    cancel();
+                    return;
+                }
+                s.pending.add(cancel);
+                timer = setTimeout(() => finish(new Error('This operation did not finish before its timeout.')), Math.max(1, Math.min(ms, s.end - clock())));
+                Promise.resolve().then(() => {
+                    if (s.closed)
+                        throw failure('CANCELLED');
+                    return make();
+                })
+                    .then(v => finish(null, v), e => finish(e));
+            });
+        }
+        /* -- Reading replies: CSV export and gviz JSONP query (raced) -------- */
+        _readCSV(s) {
+            const controller = new AbortController();
+            const url = 'https://docs.google.com/spreadsheets/d/' + this.config.responsesId +
+                '/export?format=csv&gid=' + this.config.responsesGid + '&t=' + Date.now();
+            return this._bounded(s, async () => {
+                const response = await global.fetch(url, { credentials: 'omit', cache: 'no-store', signal: controller.signal });
+                if (!response.ok)
+                    throw new Error('CSV read returned HTTP ' + response.status + '.');
+                const text = await response.text();
+                if (/^\s*</.test(text))
+                    throw new Error('CSV read returned an HTML sign-in/error page.');
+                const rows = parseCSV(text);
+                if (!rows[0] || rows[0][0] !== 'request_id' || rows[0][3] !== 'response_envelope')
+                    throw new Error('CSV read did not contain the expected response-sheet headers.');
+                const row = rows.slice(1).find(r => r[0] === s.id);
+                return row ? row[3] : null;
+            }, 6000, () => controller.abort());
+        }
+        _readQuery(s) {
+            const doc = global.document;
+            if (!doc || !doc.createElement)
+                return Promise.reject(new Error('No page document for the Sheets query.'));
+            const name = '__blq_' + randomId(), reqId = String(++s.sequence);
+            let script;
+            const cleanup = () => {
+                if (script) {
+                    script.onload = null;
+                    script.onerror = null;
+                    script.remove();
+                }
+                try {
+                    delete global[name];
+                }
+                catch (_) {
+                    global[name] = undefined;
+                }
+            };
+            return this._bounded(s, () => new Promise((resolve, reject) => {
+                global[name] = data => {
+                    try {
+                        if (!data || data.status !== 'ok' || !data.table || !Array.isArray(data.table.rows))
+                            throw new Error('Google Sheets query returned an access or query error.');
+                        if (data.reqId !== undefined && String(data.reqId) !== reqId)
+                            throw new Error('Unexpected Sheets query identifier.');
+                        const row = data.table.rows.find(r => r && Array.isArray(r.c) && r.c[0] && r.c[0].v === s.id);
+                        if (!row) {
+                            resolve(null);
+                            return;
+                        }
+                        if (!row.c[1] || typeof row.c[1].v !== 'string')
+                            throw new Error('Missing response envelope.');
+                        resolve(row.c[1].v);
+                    }
+                    catch (e) {
+                        reject(e);
+                    }
+                };
+                script = doc.createElement('script');
+                script.async = true;
+                script.referrerPolicy = 'no-referrer';
+                const qs = new URLSearchParams({
+                    gid: String(this.config.responsesGid), headers: '1',
+                    tq: "select A, D where A = '" + s.id + "' limit 1",
+                    tqx: 'version:0.6;out:json;reqId:' + reqId + ';responseHandler:' + name,
+                    t: String(Date.now())
+                });
+                // Only Google's public response-sheet query is loaded as script.
+                // No password, reply key, browser key or session token appears in this URL.
+                script.src = 'https://docs.google.com/spreadsheets/d/' + this.config.responsesId + '/gviz/tq?' + qs.toString();
+                script.onerror = () => reject(new Error('Google Sheets query was blocked or could not load.'));
+                script.onload = () => reject(new Error('Google Sheets loaded without its expected data callback.'));
+                (doc.head || doc.documentElement).appendChild(script);
+            }), 6000, cleanup);
+        }
+        /* -- Verifying replies: HMAC signature, request id, action, expiry ---- */
+        async _verify(s, envelope, key, action, sentAt) {
+            this._progress(s, 'Verifying reply', 'Checking the request ID, signature, action and expiry.');
+            let env, result;
+            try {
+                env = JSON.parse(envelope);
+                if (!env || env.v !== 1 || typeof env.payload !== 'string' || env.payload.length > 45000 ||
+                    typeof env.mac !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(env.mac))
+                    throw failure('INVALID_REPLY');
+                const valid = await this._bounded(s, () => global.crypto.subtle.verify('HMAC', key, unb64(env.mac), new TextEncoder().encode(env.payload)), 5000);
+                if (!valid)
+                    throw failure('INVALID_REPLY');
+                result = JSON.parse(env.payload);
+            }
+            catch (e) {
+                if (e.code === 'CANCELLED')
+                    throw e;
+                throw failure('INVALID_REPLY');
+            }
+            const now = Date.now();
+            if (!result || result.v !== 6 || result.id !== s.id || result.action !== action || typeof result.ok !== 'boolean' ||
+                !Number.isFinite(result.createdAt) || !Number.isFinite(result.expiresAt) ||
+                result.expiresAt <= now || result.expiresAt <= result.createdAt ||
+                result.createdAt < sentAt - 30000 || result.createdAt > now + 30000)
+                throw failure('INVALID_REPLY');
+            if (!result.ok)
+                throw failure(result.code, messages[result.code] || 'The server rejected this request.');
+            if (action === 'ping' && result.code !== 'READY')
+                throw failure('INVALID_REPLY');
+            if (['login', 'check_session'].includes(action) &&
+                (result.code !== 'OK' || !Number.isFinite(result.sessionExpiresAt) || result.sessionExpiresAt <= now))
+                throw failure('INVALID_REPLY');
+            if (action === 'logout' && result.code !== 'LOGGED_OUT')
+                throw failure('INVALID_REPLY');
+            return result;
+        }
+        /* -- One full round trip: submit Form → poll sheet → verify reply ----- */
+        async _request(action, extra) {
+            const start = clock(), s = {
+                id: randomId(), start, end: start + this.config.timeoutMs, closed: false,
+                pending: new Set(), phase: 'Starting', readSucceeded: false, lastReadError: '', sequence: 0
+            };
+            let rejectGuard;
+            const guard = new Promise((_, reject) => {
+                rejectGuard = reject;
+            });
+            const dispose = () => {
+                if (s.closed)
+                    return;
+                s.closed = true;
+                for (const cancel of [...s.pending])
+                    cancel();
+            };
+            const fail = err => {
+                rejectGuard(err);
+                dispose();
+            };
+            s.cancel = () => fail(failure('CANCELLED'));
+            const totalTimer = setTimeout(() => {
+                const code = s.readSucceeded ? 'TIMEOUT' : 'TRANSPORT_ERROR';
+                fail(failure(code, messages[code] + ' Last step: ' + s.phase +
+                    (s.lastReadError ? ' ' + s.lastReadError : '')));
+            }, this.config.timeoutMs);
+            this.active = s;
+            const run = async () => {
+                const sentAt = Date.now(), replySecret = randomKey();
+                const body = Object.assign({}, extra, { v: 6, id: s.id, action, replySecret, sentAt, origin: this.origin });
+                this._progress(s, 'Preparing request');
+                const key = await this._bounded(s, () => global.crypto.subtle.importKey('raw', unb64(replySecret), { name: 'HMAC', hash: 'SHA-256' }, false, ['verify']), 5000);
+                const params = new URLSearchParams();
+                params.set(this.config.fields.requestId, s.id);
+                params.set(this.config.fields.payload, JSON.stringify(body));
+                const controller = new AbortController();
+                this._progress(s, 'Submitting Google Form', 'This is only a submission attempt, not approval.');
+                // Start the POST, but do not wait for Google's confirmation page/redirects.
+                // Receiving and verifying a request-specific reply is the only success signal.
+                const post = this._bounded(s, () => global.fetch(this.config.formPostUrl, {
+                    method: 'POST', mode: 'no-cors', credentials: 'omit', body: params, signal: controller.signal
+                }), 8000, () => controller.abort()).catch(e => {
+                    if (!s.closed)
+                        this._progress(s, 'Waiting for server reply', 'Submission confirmation was unavailable; awaiting the signed reply.');
+                });
+                const pause = async (ms) => {
+                    let timer;
+                    await this._bounded(s, () => new Promise(resolve => {
+                        timer = setTimeout(resolve, ms);
+                    }), Math.min(ms + 200, s.end - clock()), () => clearTimeout(timer));
+                };
+                const poll = async (mode, initialDelay) => {
+                    if (initialDelay)
+                        await pause(initialDelay);
+                    while (!s.closed && clock() < s.end) {
+                        let envelope = null;
+                        try {
+                            envelope = mode === 'query' ? await this._readQuery(s) : await this._readCSV(s);
+                            s.readSucceeded = true;
+                        }
+                        catch (e) {
+                            if (s.closed)
+                                throw failure('CANCELLED');
+                            s.lastReadError = (mode === 'query' ? 'Sheets query: ' : 'CSV: ') + e.message;
+                        }
+                        if (envelope !== null) {
+                            const result = await this._verify(s, envelope, key, action, sentAt);
+                            if (s.closed)
+                                throw failure('CANCELLED');
+                            this._progress(s, 'Verified reply', result.code);
+                            return result;
+                        }
+                        this._progress(s, 'Waiting for server reply');
+                        await pause(this.config.pollMs);
+                    }
+                    throw failure(s.closed ? 'CANCELLED' : s.readSucceeded ? 'TIMEOUT' : 'TRANSPORT_ERROR');
+                };
+                return await Promise.race([poll('query', 0), poll('csv', 150)]);
+            };
+            try {
+                return await Promise.race([run(), guard]);
+            }
+            catch (e) {
+                if (!(e instanceof AuthError)) {
+                    const code = s.readSucceeded ? 'TIMEOUT' : 'TRANSPORT_ERROR';
+                    e = failure(code, messages[code] + ' Last step: ' + s.phase);
+                }
+                e.requestId = s.id;
+                throw e;
+            }
+            finally {
+                clearTimeout(totalTimer);
+                dispose();
+                if (this.active === s)
+                    this.active = null;
+            }
+        }
+        /* -- Public session API: ping, resume, login, check, logout ---------- */
+        ping() {
+            return this._serial(() => this._request('ping', {}));
+        }
+        _validSession(saved) {
+            return !!saved && typeof saved.username === 'string' && saved.username.trim().length > 0 &&
+                /^[A-Za-z0-9_-]{43}$/.test(saved.sessionToken || '') &&
+                Number.isFinite(saved.expiresAt) && saved.expiresAt > Date.now();
+        }
+        _catalog(games) {
+            if (!games || typeof games !== 'object' || Array.isArray(games))
+                return null;
+            const clean = Object.create(null);
+            for (const [name, g] of Object.entries(games)) {
+                if (!name || !g || typeof g.url !== 'string' || !/^https:\/\//i.test(g.url))
+                    return null;
+                clean[name] = { url: g.url, icon: String(g.icon || ''), type: String(g.type || '') };
+            }
+            return clean;
+        }
+        resume() {
+            const saved = this._saved();
+            if (!this._validSession(saved) || saved.origin !== this.origin)
+                return null;
+            const games = this._catalog(saved.games);
+            if (!games || !Number.isFinite(saved.lastVerifiedAt) ||
+                saved.lastVerifiedAt > Date.now() + 30000)
+                return null;
+            if (saved.protected === true && !this._browserKey(saved.username, false))
+                return null;
+            this.options = { heartbeatSeconds: 60, checkBeforeLaunch: false };
+            return {
+                ok: true, code: 'OK', username: saved.username, games,
+                sessionExpiresAt: saved.expiresAt, protected: saved.protected === true,
+                cached: true, lastVerifiedAt: saved.lastVerifiedAt
+            };
+        }
+        _store(saved, result) {
+            const games = this._catalog(result.games) || this._catalog(saved.games);
+            const value = {
+                username: saved.username, sessionToken: saved.sessionToken, expiresAt: result.sessionExpiresAt,
+                origin: this.origin, lastVerifiedAt: Date.now(), games,
+                protected: typeof result.protected === 'boolean' ? result.protected : saved.protected === true,
+                heartbeatSeconds: result.heartbeatSeconds || 60
+            };
+            this.storage.setItem(this.sessionName, JSON.stringify(value));
+            this.options = { heartbeatSeconds: value.heartbeatSeconds, checkBeforeLaunch: false };
+            return value;
+        }
+        login(username, password) {
+            return this._serial(async () => {
+                username = String(username).trim();
+                const browserKey = this._browserKey(username), sessionToken = randomKey();
+                const result = await this._request('login', {
+                    username, password: String(password), browserKey, sessionToken, includeGames: true
+                });
+                if (!this._catalog(result.games))
+                    throw failure('INVALID_REPLY', 'The server did not return a valid game catalog.');
+                try {
+                    this._store({ username, sessionToken }, result);
+                }
+                catch (_) {
+                    throw failure('STORAGE_ERROR', 'Login was accepted but the browser could not save the session.');
+                }
+                return result;
+            });
+        }
+        check(includeGames = true) {
+            // One network recheck shared by heartbeat, focus and resume; no queue of duplicate checks.
+            if (this.checkJob)
+                return this.checkJob;
+            this.checkJob = this._serial(async () => {
+                const saved = this._saved();
+                if (!this._validSession(saved))
+                    throw failure('INVALID_SESSION');
+                const browserKey = this._browserKey(saved.username, false);
+                try {
+                    const result = await this._request('check_session', {
+                        sessionToken: saved.sessionToken, browserKey, includeGames
+                    });
+                    // Another tab may have signed out or signed into a different account meanwhile.
+                    const current = this._saved();
+                    if (!current || current.sessionToken !== saved.sessionToken)
+                        throw failure('CANCELLED');
+                    this._store(saved, result);
+                    return result;
+                }
+                catch (e) {
+                    if (['ACCOUNT_BANNED', 'ACCOUNT_DISABLED', 'INVALID_SESSION', 'SESSION_REVOKED', 'BROWSER_LOCKED'].includes(e.code)) {
+                        const current = this._saved();
+                        if (current && current.sessionToken === saved.sessionToken)
+                            this.storage.removeItem(this.sessionName);
+                    }
+                    throw e;
+                }
+            }).finally(() => {
+                this.checkJob = null;
+            });
+            return this.checkJob;
+        }
+        logout() {
+            this.stopHeartbeat();
+            const saved = this._saved();
+            this.storage.removeItem(this.sessionName); // local logout is immediate
+            this.cancelPendingRequests();
+            return this._serial(async () => {
+                if (saved && /^[A-Za-z0-9_-]{43}$/.test(saved.sessionToken || ''))
+                    return this._request('logout', { sessionToken: saved.sessionToken });
+                return { ok: true, code: 'LOGGED_OUT' };
+            });
+        }
+        /* -- Heartbeat: background re-check every heartbeatSeconds (≥ 60 s) -- */
+        startHeartbeat(onBlocked, onRestored) {
+            this.stopHeartbeat();
+            let stopped = false;
+            const run = async () => {
+                try {
+                    const r = await this.check(true);
+                    if (onRestored)
+                        onRestored(r);
+                }
+                catch (e) {
+                    if (onBlocked)
+                        onBlocked(e);
+                }
+                if (!stopped)
+                    this.timer = setTimeout(run, Math.max(60, this.options.heartbeatSeconds || 60) * 1000);
+            };
+            this.stopHeartbeat = () => {
+                stopped = true;
+                if (this.timer)
+                    clearTimeout(this.timer);
+                this.timer = null;
+            };
+            this.timer = setTimeout(run, Math.max(60, this.options.heartbeatSeconds || 60) * 1000);
+        }
+        stopHeartbeat() {
+            if (this.timer)
+                clearTimeout(this.timer);
+            this.timer = null;
+        }
+    }
+    BookmarkletFormsAuth.AuthError = AuthError;
+    BookmarkletFormsAuth.parseCSV = parseCSV;
+    BookmarkletFormsAuth.build = BUILD;
+    global.BookmarkletFormsAuth = BookmarkletFormsAuth;
+})(typeof window !== 'undefined' ? window : globalThis);
+
+/* ##########################################################################
+ * §2  APP · CONFIG
+ * --------------------------------------------------------------------------
+ *  Everything from here down runs inside one async function, so running the
+ *  bookmark twice never collides with variables from an earlier run.
+ * ########################################################################## */
+(async function main() {
+    'use strict';
+
+    /* Backend endpoints — paste new values from Setup!B5 if the backend moves. */
+    var BACKEND = {
+        version: 6,
+        formPostUrl: 'https://docs.google.com/forms/d/e/1FAIpQLSeBlf7Obva60OWFuBZ0OU-1s7wF7wCB9269KrKit5Srn9WuUA/formResponse',
+        fields: { requestId: 'entry.1616999615', payload: 'entry.1606093115' },
+        responsesId: '1mM3xGjhU64jkZ_6LG_EIpxeoPz39p5ocpHGCyMMzAxk',
+        responsesGid: 1667445748,
+        timeoutMs: 45000,
+        pollMs: 750
+    };
+
+    var TIMING = {
+        reverifyAfterMs: 60 * 1000,       // focus / re-click re-checks a session older than this
+        offlineGraceMs: 15 * 60 * 1000,   // network outage tolerated before play pauses
+        gameDownloadMs: 30 * 1000,        // per-game download timeout
+        popupHostWaitMs: 10 * 1000        // Google-host pop-outs: wait for the host page
+    };
+
+    var GAME_CACHE = { maxItemBytes: 2 * 1024 * 1024, maxTotalBytes: 8 * 1024 * 1024 };
+
+    /* Ids of the overlays this bookmark adds to the page it runs on. */
+    var HOST_ID = {
+        login: 'bl-forms-login-v8',
+        restore: 'bl-forms-restore-v8',
+        notice: 'bl-forms-notice-v8',
+        block: 'bl-access-block-v8',
+        dialog: 'bl-dialog-v8'
+    };
+
+    /* Server codes that end the session for good (no "retry" offered). */
+    var DENY_CODES = [
+        'ACCOUNT_BANNED', 'ACCOUNT_DISABLED', 'INVALID_SESSION', 'SESSION_REVOKED',
+        'BROWSER_LOCKED', 'INVALID_PROTECTION_SETTING'
+    ];
+
+    /* Per-user localStorage keys. Names are unchanged from v8.1 so stats,
+     * favorites and avatars carry over. */
+    function storageKeys(user) {
+        var u = user.toLowerCase();
+        return {
+            avatar: 'userPfp_' + u,
+            stats: 'gameStats_' + u,
+            favorites: 'gameFavs_' + u,
+            recent: 'gameRecent_' + u,
+            member: 'gameMember_' + u,
+            appearance: THEME.prefKey + u,
+            effects: 'gameFx_' + u
+        };
+    }
+    var TIME_DELTA_KEY = '_gameTimeDelta';   // playtime reported by instrumented games
+
+    /* ##########################################################################
+     * §3  UI · ICONS  (shared line icons; themes may add their own in THEME.icons)
+     * ########################################################################## */
+    function svg(size, body, extra) {
+        return '<svg xmlns="http://www.w3.org/2000/svg" width="' + size + '" height="' + size +
+            '" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"' +
+            (extra || '') + '>' + body + '</svg>';
+    }
+    var P = {
+        user: '<path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/><circle cx="12" cy="7" r="4"/>',
+        heart: '<path d="M20.84 4.61a5.5 5.5 0 0 0-7.78 0L12 5.67l-1.06-1.06a5.5 5.5 0 0 0-7.78 7.78l1.06 1.06L12 21.23l7.78-7.78 1.06-1.06a5.5 5.5 0 0 0 0-7.78z"/>',
+        clock: '<circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/>',
+        star: '<path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z"/>',
+        controller: '<rect x="2" y="7" width="20" height="14" rx="0"/><path d="M6 3v4M18 3v4M8 21v-4M16 21v-4M10 11h4"/>',
+        moon: '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>',
+        x: '<line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/>',
+        img: '<rect x="3" y="3" width="18" height="18" rx="0"/><circle cx="8.5" cy="8.5" r="1.5"/><polyline points="21 15 16 10 5 21"/>',
+        search: '<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/>',
+        activity: '<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>',
+        chart: '<line x1="18" y1="20" x2="18" y2="10"/><line x1="12" y1="20" x2="12" y2="4"/><line x1="6" y1="20" x2="6" y2="14"/>',
+        trophy: '<path d="M6 9H4.5a2.5 2.5 0 0 1 0-5H6"/><path d="M18 9h1.5a2.5 2.5 0 0 0 0-5H18"/><path d="M4 22h16"/><path d="M10 14.66V17c0 .55-.47.98-.97 1.21C7.85 18.75 7 20.24 7 22"/><path d="M14 14.66V17c0 .55.47.98.97 1.21C16.15 18.75 17 20.24 17 22"/><path d="M18 2H6v7a6 6 0 0 0 12 0V2z"/>',
+        eye: '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>',
+        eyeOff: '<path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/><line x1="1" y1="1" x2="23" y2="23"/>',
+        lock: '<rect x="3" y="11" width="18" height="11" rx="0"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+        alert: '<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>',
+        wifiOff: '<line x1="1" y1="1" x2="23" y2="23"/><path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"/><path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"/><path d="M10.71 5.05A16 16 0 0 1 22.58 9"/><path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><line x1="12" y1="20" x2="12.01" y2="20"/>',
+        external: '<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>'
+    };
+    var ICON = {
+        user: svg(14, P.user), heart: svg(14, P.heart), heartFill: svg(14, P.heart, ' fill="currentColor"'),
+        clock: svg(14, P.clock), star: svg(14, P.star), controller: svg(14, P.controller),
+        moon: svg(14, P.moon), x: svg(14, P.x, ' stroke-width="2.5"'), xLg: svg(18, P.x, ' stroke-width="2.5"'),
+        play: '<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><polygon points="6,4 6,20 20,12"/></svg>',
+        img: svg(14, P.img), search: svg(16, P.search), activity: svg(14, P.activity), chart: svg(14, P.chart),
+        trophy: svg(14, P.trophy), eye: svg(18, P.eye), eyeOff: svg(18, P.eyeOff), userLg: svg(18, P.user),
+        lock: svg(12, P.lock), alert: svg(22, P.alert), wifiOff: svg(22, P.wifiOff), external: svg(22, P.external)
+    };
+
+    /* ##########################################################################
+     * §4  UI · THEME
+     * --------------------------------------------------------------------------
+     *  Every color, font, string and piece of markup lives here, so the look
+     *  can change without touching the logic below. It provides:
+     *     4a  identity      id, fonts, appearance variants
+     *     4b  copy          every user-facing string
+     *     4c  css.shadow    sign-in / restoring / notice screens (shadow DOM)
+     *     4d  css.library   the library page, profile panel, dialogs, toasts
+     *     4e  css.popup     pop-out game window (loading screen + close button)
+     *     4f  markup        HTML for each screen
+     *
+     *  Element ids the app code relies on (keep them if you redesign):
+     *    sign-in  : u p eyeBtn lBtn lBtnTxt lMsg lPhase      notice: nClose
+     *    header   : toggleM uName pfpCircle drp pdMi avMi pfpInp soBtn npBadge npTxt
+     *    hero     : wg ws accessStatus accessText rCount sDate
+     *    search   : sb sc noRes noResSub
+     *    sections : favSec favGrid favCount recSec recGrid recCount allSec list allCount
+     *    panel    : pOv pPanel phClose phAv phName phSub sg ptList pFavs pRecent pAch
+     *               buttons .tbtn[data-theme] (and optional .tbtn[data-fx])
+     *    game     : gOver closeBtn gFrame        footer: ftYr
+     * ########################################################################## */
+    var THEME = {
+
+        /* ---- 4a. Identity ----------------------------------------------------- */
+        id: 'original',
+        fontsHref: 'https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,300;9..144,400;9..144,500;9..144,700&family=IBM+Plex+Mono:wght@400;500;600&display=swap',
+        prefKey: 'gameTheme_',                     // same key v8.1 used
+        appearances: [{ id: 'dark', label: 'Dark' }, { id: 'light', label: 'Light' }],
+        icons: {},
+        dialogIcon: function () { return ''; },
+
+        /* ---- 4b. Copy --------------------------------------------------------- */
+        copy: {
+            pageTitle: 'Game Library',
+            signIn: 'Sign In',
+            signingIn: 'Verifying',
+            missingFields: 'Enter a username and password.',
+            openFailedTitle: 'Library could not finish opening',
+            restoring: 'Restoring your saved library…',
+            phase: {},                                 // shows the client's raw step names
+            greeting: function (hour, nameHtml) {
+                var g = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
+                return g + ', <em>' + nameHtml + '</em>.';
+            },
+            lede: function (n) { return 'You have ' + n + ' games available. What are we playing today?'; },
+            resourceCount: function (n) { return n + ' Active'; },
+            footerRight: function (n) { return new Date().getUTCFullYear() + ' · ' + n + ' GAMES'; },
+            searchPlaceholder: function () { return 'Search games...'; },
+            dateValue: function (d) { return d.toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }); },
+            memberSince: function (s) { return 'Member since ' + s; },
+            status: {
+                online: 'Online', reconnecting: 'Reconnecting', paused: 'Access paused',
+                banned: 'Account banned', signin: 'Sign-in required'
+            },
+            count: function (n) { return String(n).padStart(2, '0'); },
+            noResultsSub: function () { return 'Try a different query.'; },
+            playLabel: function (name) { return 'Play ' + name; },
+            favLabel: function () { return 'Favorite'; },
+            favAdded: 'Added to favorites',
+            favRemoved: 'Removed from favorites',
+            achievementToast: function (name) { return 'Achievement: ' + name; },
+            achievements: [
+                ['First Launch', 'Opened your first game'],
+                ['Explorer', 'Played 3 different games'],
+                ['Game Hopper', 'Played 5 different games'],
+                ['Dedicated', '1 hour total playtime'],
+                ['Marathon', '5 hours total playtime'],
+                ['Collector', 'Favorited 3 games'],
+                ['Curator', 'Favorited 5 games'],
+                ['Regular', '10 game sessions']
+            ],
+            statLabels: ['Playtime', 'Games Played', 'Top Game', 'Favorites'],
+            empty: { playtime: 'No playtime yet.', favorites: 'No favorites yet.', recent: 'No games yet.' },
+            recentIndex: function (i) { return '0' + (i + 1); },
+            nowPlaying: function (name) { return 'Now Playing: ' + name; },
+            popupTitle: function (name) { return 'Loading ' + name; },
+            closeGame: 'Close game',
+            avatarSaved: 'Avatar updated',
+            avatarTooLarge: 'Avatar too large to save.',
+            avatarNotImage: 'Choose an image file.',
+            access: {
+                banned: { label: 'Access control', title: 'Account banned', message: 'This account has been banned. Contact the owner to restore access.' },
+                signin: { label: 'Session', title: 'Sign-in required', message: 'Reconnect to verify your saved session.' },
+                paused: { label: 'Connection', title: 'Access paused', message: 'Reconnect to verify your saved session.' },
+                retry: 'Retry connection',
+                retrying: 'Checking…',
+                useAnother: 'Use another account',
+                signIn: 'Sign in'
+            },
+            popupBlocked: {
+                label: 'Pop-up blocked',
+                title: 'Allow pop-ups to play',
+                message: function (name) { return name + ' opens in its own window. Allow pop-ups for this site in the address bar, then try again.'; }
+            },
+            launchFailed: {
+                label: 'Launch error',
+                title: function (name) { return 'Couldn’t open ' + name; },
+                fallback: 'The game could not be loaded.'
+            },
+            tryAgain: 'Try again',
+            close: 'Close',
+            notices: {
+                refreshTitle: 'Refresh this page',
+                refreshMessage: 'An older version of the library is open here. Refresh the page once, then click the bookmark again.'
+            }
+        },
+
+        css: {
+            /* ---- 4c. Shadow screens: sign-in, restoring, notice ------------------ */
+            shadow: `
+*{box-sizing:border-box;margin:0;padding:0;font-family:"IBM Plex Mono",ui-monospace,SFMono-Regular,monospace;}
+.lroot{position:fixed;inset:0;display:flex;justify-content:center;align-items:center;color:#f4ede4;font-size:16px;line-height:1.5;}
+#lbg{position:absolute;inset:0;background:#0c0a09;}
+#lbg::before{content:"";position:absolute;inset:0;pointer-events:none;opacity:.06;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");mix-blend-mode:overlay;}
+#lbg::after{content:"";position:absolute;top:-20%;left:-10%;width:60%;height:70%;background:radial-gradient(ellipse,rgba(234,88,12,.18),transparent 60%);filter:blur(60px);pointer-events:none;}
+#lcard{position:relative;width:380px;max-width:90vw;border:1px solid #44403c;background:linear-gradient(180deg,rgba(28,25,23,.85),rgba(12,10,9,.85));backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);padding:2.5rem 2.25rem;}
+#lcard::before{content:"";position:absolute;top:-1px;left:-1px;width:40px;height:3px;background:#ea580c;}
+.llabel{display:inline-block;font-size:.65rem;letter-spacing:.25em;text-transform:uppercase;color:#ea580c;border:1px solid #ea580c;padding:.2rem .55rem;margin-bottom:1.5rem;}
+.lt{font-family:"Fraunces",Georgia,serif;font-weight:300;font-size:2.4rem;line-height:1;letter-spacing:-.035em;margin-bottom:.5rem;color:#f4ede4;}
+.lt em{font-family:inherit;font-style:italic;font-weight:500;color:#ea580c;}
+.ls{color:#a8a29e;font-size:.82rem;margin-bottom:2rem;}
+.lflabel{font-size:.65rem;letter-spacing:.2em;text-transform:uppercase;color:#a8a29e;margin-bottom:.55rem;display:flex;justify-content:space-between;}
+.lmk{display:inline-flex;align-items:center;color:#ea580c;margin-right:.35rem;vertical-align:middle;transform:translateY(-1px);}
+.lmk svg{width:12px;height:12px;display:block;}
+.lf{position:relative;margin-bottom:1.1rem;}
+.lf input{display:block;width:100%;padding:.85rem 2.6rem .85rem 1rem;background:#0c0a09;color:#f4ede4;border:1px solid #44403c;font-size:.9rem;outline:none;transition:border-color .15s;line-height:1.4;border-radius:0;-webkit-appearance:none;appearance:none;}
+.lf input:focus{border-color:#ea580c;}
+.lf input:disabled{opacity:.55;}
+.lf input::placeholder{color:#a8a29e;opacity:.5;}
+.lico{position:absolute;right:.85rem;top:50%;transform:translateY(-50%);color:#a8a29e;user-select:none;display:flex;align-items:center;justify-content:center;transition:color .15s;background:none;border:0;padding:0;}
+button.lico{cursor:pointer;}
+button.lico:hover,button.lico:focus-visible{color:#ea580c;outline:none;}
+#lBtn,.lbtn{display:flex;width:100%;padding:.9rem;background:#ea580c;color:#0c0a09;border:1px solid #ea580c;font-weight:600;font-size:.9rem;cursor:pointer;letter-spacing:.05em;transition:all .15s;align-items:center;justify-content:center;gap:.5rem;border-radius:0;-webkit-appearance:none;appearance:none;}
+#lBtn:hover:not(:disabled),.lbtn:hover{background:#f4ede4;border-color:#f4ede4;}
+#lBtn:focus-visible,.lbtn:focus-visible{outline:2px solid #f4ede4;outline-offset:2px;}
+#lBtn:disabled{opacity:.75;cursor:progress;}
+.lsp{display:none;width:14px;height:14px;border:2px solid rgba(12,10,9,.3);border-top-color:#0c0a09;border-radius:50%;animation:spn .7s linear infinite;}
+#lBtn.busy .lsp{display:block;}
+@keyframes spn{to{transform:rotate(360deg);}}
+.lphase{min-height:1.1rem;margin-top:.75rem;font-size:.65rem;letter-spacing:.18em;text-transform:uppercase;color:#a8a29e;opacity:0;transition:opacity .2s;}
+.lphase.on{opacity:1;}
+.lphase.on::before{content:"";display:inline-block;width:6px;height:6px;margin-right:.55rem;background:#ea580c;vertical-align:middle;animation:blink 1s steps(2) infinite;}
+@keyframes blink{50%{opacity:.2;}}
+.emsg{display:none;margin-top:.5rem;padding:.7rem .85rem;background:rgba(220,38,38,.1);border-left:2px solid #dc2626;color:#fca5a5;font-size:.78rem;}
+.emsg.on{display:block;}
+.emsg.shake{animation:shk .35s ease;}
+.emsg-t{display:block;color:#fecaca;font-weight:600;margin-bottom:.15rem;}
+.emsg-d{display:block;}
+.emsg-c{display:inline-block;margin-top:.45rem;font-size:.62rem;letter-spacing:.15em;color:#f87171;border:1px solid rgba(248,113,113,.4);padding:.05rem .4rem;font-family:inherit;}
+.emsg.banned{background:rgba(220,38,38,.16);border-left-width:3px;}
+@keyframes shk{0%,100%{transform:translateX(0);}25%{transform:translateX(-5px);}75%{transform:translateX(5px);}}
+.rest{position:relative;display:flex;flex-direction:column;align-items:center;gap:1.25rem;}
+.rest .lsp{display:block;width:28px;height:28px;border-color:rgba(234,88,12,.25);border-top-color:#ea580c;}
+.rest-t{font-family:"Fraunces",Georgia,serif;font-size:1.4rem;font-weight:300;letter-spacing:-.02em;}
+.rest-s{font-size:.62rem;letter-spacing:.25em;text-transform:uppercase;color:#a8a29e;}
+svg{display:block;}
+@media (prefers-reduced-motion:reduce){*{animation-duration:.01ms !important;animation-iteration-count:1 !important;}}
+`,
+
+            /* ---- 4d. Library page ------------------------------------------------ */
+            library: `
+:root{color-scheme:dark;--bg:#0c0a09;--bg2:#1c1917;--line:#292524;--line2:#44403c;--ink:#f4ede4;--ink-dim:#a8a29e;--accent:#ea580c;--accent2:#fbbf24;--red:#f87171;--grn:#22c55e;--serif:"Fraunces",Georgia,"Times New Roman",serif;--mono:"IBM Plex Mono",ui-monospace,SFMono-Regular,Menlo,monospace;}
+body.th-light{color-scheme:light;--bg:#f5f1ea;--bg2:#ebe5db;--line:#d6cdbf;--line2:#a8a29e;--ink:#1c1917;--ink-dim:#57534e;--accent:#c2410c;--accent2:#b45309;--red:#dc2626;--grn:#15803d;}
+*{box-sizing:border-box;margin:0;padding:0;}
+html,body{height:100%;}
+body{font-family:var(--mono);background:var(--bg);color:var(--ink);line-height:1.5;overflow-x:hidden;position:relative;transition:background .25s,color .25s;}
+body::before{content:"";position:fixed;inset:0;pointer-events:none;z-index:100;opacity:.06;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='3'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");mix-blend-mode:overlay;}
+body.th-light::before{opacity:.04;}
+body::after{content:"";position:fixed;top:-20%;left:-10%;width:60%;height:70%;background:radial-gradient(ellipse,rgba(234,88,12,.18),transparent 60%);pointer-events:none;z-index:-1;filter:blur(60px);}
+body.th-light::after{opacity:.4;}
+button{font:inherit;color:inherit;}
+:focus-visible{outline:2px solid var(--accent);outline-offset:2px;}
+.container{max-width:1200px;margin:0 auto;padding:1.75rem 2.5rem 6rem;min-height:100vh;display:flex;flex-direction:column;}
+@media(max-width:640px){.container{padding:1.5rem 1.25rem 5rem;}}
+
+/* header + user menu */
+header{display:flex;justify-content:space-between;align-items:center;padding-bottom:1.25rem;border-bottom:1px solid var(--line);margin-bottom:3rem;gap:1rem;}
+.logo{font-family:var(--serif);font-style:italic;font-size:1.4rem;font-weight:400;letter-spacing:-.02em;cursor:default;}
+.logo b{font-weight:700;font-style:normal;color:var(--accent);}
+.nav-right{display:flex;align-items:center;gap:.75rem;min-width:0;}
+#npBadge{display:none;align-items:center;gap:.5rem;font-size:.65rem;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-dim);max-width:240px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+#npBadge.on{display:flex;}
+#npDot{width:7px;height:7px;background:var(--grn);border-radius:50%;flex-shrink:0;animation:npp 1.4s ease-in-out infinite;box-shadow:0 0 8px var(--grn);}
+@keyframes npp{0%,100%{opacity:1;}50%{opacity:.4;}}
+.umenu{position:relative;}
+.uinfo{display:flex;align-items:center;gap:.6rem;background:transparent;padding:.4rem .85rem;border:1px solid var(--line2);font-size:.78rem;cursor:pointer;transition:all .15s;user-select:none;color:var(--ink);font-family:var(--mono);}
+.uinfo:hover{border-color:var(--accent);color:var(--accent);}
+#pfpCircle{width:22px;height:22px;background:var(--bg2);display:grid;place-items:center;font-family:var(--serif);font-size:.7rem;font-weight:600;overflow:hidden;border:1px solid var(--line2);flex-shrink:0;}
+#pfpCircle img{width:100%;height:100%;object-fit:cover;}
+.dd{position:absolute;top:calc(100% + .5rem);right:0;background:var(--bg);border:1px solid var(--line2);width:220px;padding:.4rem;opacity:0;transform:translateY(-8px);pointer-events:none;transition:opacity .15s,transform .15s;z-index:500;}
+.dd.open{opacity:1;transform:translateY(0);pointer-events:all;}
+.di{width:100%;background:none;border:0;text-align:left;padding:.6rem .75rem;cursor:pointer;font-size:.78rem;color:var(--ink);display:flex;align-items:center;gap:.6rem;transition:.15s;font-family:var(--mono);}
+.di:hover,.di:focus-visible{background:var(--bg2);color:var(--accent);outline:none;}
+.ddiv{border:none;border-top:1px solid var(--line);margin:.3rem 0;}
+.dred{color:var(--red);}
+.dred:hover,.dred:focus-visible{color:#fff !important;background:#dc2626;}
+
+/* hero + status grid */
+.hero{display:grid;grid-template-columns:1fr;gap:2rem;align-items:end;margin-bottom:3rem;}
+@media(min-width:880px){.hero{grid-template-columns:1.4fr 1fr;}}
+.hero-label{display:inline-block;font-size:.62rem;letter-spacing:.25em;text-transform:uppercase;color:var(--accent);border:1px solid var(--accent);padding:.2rem .55rem;margin-bottom:1.25rem;}
+h1.greet{font-family:var(--serif);font-weight:300;font-size:clamp(2.4rem,6vw,4.4rem);line-height:1;letter-spacing:-.035em;margin-bottom:.85rem;overflow-wrap:anywhere;}
+h1.greet em{font-style:italic;font-weight:500;color:var(--accent);}
+.lede{color:var(--ink-dim);font-size:.9rem;max-width:42ch;}
+.idx{font-family:var(--serif);font-size:5.5rem;font-weight:300;line-height:1;color:var(--line2);text-align:right;user-select:none;}
+.idx small{display:block;font-family:var(--mono);font-size:.62rem;letter-spacing:.2em;color:var(--ink-dim);margin-top:.5rem;text-transform:uppercase;}
+@media(max-width:880px){.idx{display:none;}}
+.dg{display:grid;grid-template-columns:repeat(3,1fr);gap:0;border:1px solid var(--line);margin-bottom:2.5rem;}
+@media(max-width:600px){.dg{grid-template-columns:1fr;}.dg>*+*{border-top:1px solid var(--line);}}
+@media(min-width:601px){.dg>*+*{border-left:1px solid var(--line);}}
+.ditem{padding:1rem 1.25rem;position:relative;}
+.ditem::before{content:"";position:absolute;top:-1px;left:-1px;width:24px;height:2px;background:var(--accent);}
+.dl{color:var(--ink-dim);font-size:.62rem;font-weight:600;text-transform:uppercase;margin-bottom:.4rem;letter-spacing:.18em;}
+.dv{color:var(--ink);font-family:var(--serif);font-size:1.05rem;font-weight:400;display:flex;align-items:center;gap:.4rem;}
+#accessStatus{transition:color .2s;}
+#accessStatus[data-state=online]{color:var(--grn);}
+#accessStatus[data-state=reconnecting],#accessStatus[data-state=paused]{color:var(--accent2);}
+#accessStatus[data-state=banned],#accessStatus[data-state=signin]{color:var(--red);}
+#accessStatus[data-state=reconnecting] svg{animation:npp 1s ease-in-out infinite;}
+
+/* search */
+.sw-block{border:1px solid var(--line2);background:transparent;padding:1.5rem 1.75rem;margin-bottom:3rem;position:relative;}
+.sw-block::before{content:"";position:absolute;top:-1px;left:-1px;width:36px;height:3px;background:var(--accent);}
+.sw-label{font-size:.62rem;letter-spacing:.2em;text-transform:uppercase;color:var(--ink-dim);margin-bottom:.85rem;display:flex;justify-content:space-between;gap:1rem;}
+.sw-label kbd{font-family:var(--mono);border:1px solid var(--line2);padding:0 .35rem;margin-left:.25rem;}
+@media(max-width:600px){.sw-label>span:last-child{display:none;}}
+.sw{position:relative;}
+.sb-icon{position:absolute;left:1rem;top:50%;transform:translateY(-50%);color:var(--ink-dim);pointer-events:none;display:grid;place-items:center;}
+.sbar{width:100%;padding:.85rem 2.6rem .85rem 2.6rem;background:var(--bg);border:1px solid var(--line2);color:var(--ink);font-family:var(--mono);font-size:.9rem;outline:none;transition:border-color .15s;border-radius:0;}
+.sbar:focus{border-color:var(--accent);}
+.sbar::placeholder{color:var(--ink-dim);opacity:.55;}
+.sclr{position:absolute;right:1rem;top:50%;transform:translateY(-50%);background:transparent;border:none;color:var(--ink-dim);cursor:pointer;padding:.25rem;display:none;align-items:center;justify-content:center;}
+.sclr:hover{color:var(--accent);}
+.sclr.on{display:flex;}
+.lmk{display:inline-flex;align-items:center;color:var(--accent);margin-right:.35rem;vertical-align:middle;transform:translateY(-1px);}
+.lmk svg{width:12px;height:12px;display:block;}
+
+/* sections + game cards */
+#favSec,#recSec,#allSec{display:none;margin-bottom:3rem;}
+.slbl{font-size:.62rem;font-weight:600;text-transform:uppercase;color:var(--ink-dim);letter-spacing:.25em;margin-bottom:1.25rem;display:flex;justify-content:space-between;align-items:baseline;padding-bottom:.75rem;border-bottom:1px solid var(--line);}
+.slbl .scount{font-family:var(--mono);font-size:.62rem;color:var(--ink-dim);}
+#favGrid,#recGrid,#list{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:0;border-top:1px solid var(--line);border-left:1px solid var(--line);}
+.card{background:transparent;border-right:1px solid var(--line);border-bottom:1px solid var(--line);padding:1.5rem 1rem;cursor:pointer;transition:background .2s,color .2s;display:flex;flex-direction:column;align-items:center;gap:.85rem;position:relative;opacity:0;animation:cIn .4s ease forwards;outline:none;}
+.card:hover,.card:focus-visible{background:var(--bg2);}
+.card:focus-visible{box-shadow:inset 0 0 0 2px var(--accent);}
+.card:hover .ib,.card:focus-visible .ib{border-color:var(--accent);}
+.card:hover .cn,.card:focus-visible .cn{color:var(--accent);}
+@keyframes cIn{from{opacity:0;transform:translateY(8px);}to{opacity:1;transform:translateY(0);}}
+.ib{width:80px;height:80px;background:var(--bg2);display:flex;align-items:center;justify-content:center;overflow:hidden;border:1px solid var(--line2);position:relative;transition:border-color .2s;}
+.ib .mono{font-family:var(--serif);font-size:2rem;font-weight:300;font-style:italic;color:var(--line2);user-select:none;}
+.ib img{width:100%;height:100%;object-fit:cover;opacity:0;transition:opacity .35s;position:absolute;inset:0;}
+.ib img.ok{opacity:1;}
+.play{position:absolute;inset:0;display:grid;place-items:center;opacity:0;transition:opacity .15s;pointer-events:none;background:rgba(234,88,12,.85);color:#0c0a09;}
+.card:hover .play,.card:focus-visible .play{opacity:1;}
+.cspin{position:absolute;inset:0;place-items:center;background:rgba(12,10,9,.78);z-index:2;}
+.cspin i{width:22px;height:22px;border:2px solid rgba(234,88,12,.3);border-top-color:var(--accent);border-radius:50%;animation:spn .7s linear infinite;}
+@keyframes spn{to{transform:rotate(360deg);}}
+.card.loading .cn::after{content:" \\2026";}
+.cn{font-family:var(--serif);font-weight:400;color:var(--ink);font-size:.95rem;text-align:center;line-height:1.3;letter-spacing:-.01em;transition:color .2s;overflow-wrap:anywhere;}
+.hrt{position:absolute;top:.6rem;right:.6rem;background:none;border:none;cursor:pointer;padding:.3rem;color:var(--ink-dim);opacity:.5;transition:.15s;display:grid;place-items:center;z-index:3;}
+.hrt:hover,.hrt:focus-visible{opacity:1;color:var(--red);}
+.hrt.on{opacity:1;color:var(--red);}
+#noRes{display:none;text-align:center;padding:3.5rem 1.25rem;color:var(--ink-dim);border:1px dashed var(--line2);margin-bottom:3rem;}
+#noRes .nr-title{font-family:var(--serif);font-size:1.4rem;font-weight:400;font-style:italic;color:var(--ink);margin-bottom:.4rem;}
+#noRes .nr-sub{font-size:.78rem;color:var(--ink-dim);}
+
+/* profile panel */
+#pOv{position:fixed;inset:0;background:rgba(0,0,0,.65);backdrop-filter:blur(4px);z-index:2999;opacity:0;pointer-events:none;transition:opacity .3s;}
+#pOv.open{opacity:1;pointer-events:all;}
+#pPanel{position:fixed;top:0;right:-440px;width:420px;max-width:100vw;height:100%;background:var(--bg);border-left:1px solid var(--line2);z-index:3000;overflow-y:auto;transition:right .35s cubic-bezier(.4,0,.2,1),visibility 0s linear .35s;scrollbar-width:thin;visibility:hidden;}
+#pPanel.open{right:0;visibility:visible;transition:right .35s cubic-bezier(.4,0,.2,1),visibility 0s;}
+#pPanel::-webkit-scrollbar{width:6px;}
+#pPanel::-webkit-scrollbar-thumb{background:var(--line2);}
+.ph{padding:2rem 1.75rem 1.5rem;border-bottom:1px solid var(--line);position:relative;}
+.ph::before{content:"";position:absolute;top:0;left:0;width:48px;height:3px;background:var(--accent);}
+.phClose{position:absolute;top:1.25rem;right:1.25rem;background:transparent;border:1px solid var(--line2);color:var(--ink-dim);width:32px;height:32px;cursor:pointer;display:grid;place-items:center;transition:.15s;}
+.phClose:hover{border-color:var(--red);color:var(--red);}
+.phLabel{font-size:.62rem;letter-spacing:.25em;text-transform:uppercase;color:var(--accent);margin-bottom:.75rem;}
+.phRow{display:flex;align-items:center;gap:1rem;}
+.phAv{width:64px;height:64px;background:var(--bg2);border:1px solid var(--line2);display:grid;place-items:center;font-family:var(--serif);font-size:1.5rem;font-weight:500;color:var(--ink);overflow:hidden;cursor:pointer;flex-shrink:0;transition:border-color .15s;padding:0;}
+.phAv:hover{border-color:var(--accent);}
+.phAv img{width:100%;height:100%;object-fit:cover;}
+.phName{font-family:var(--serif);font-size:1.6rem;font-weight:400;letter-spacing:-.02em;line-height:1;margin-bottom:.3rem;overflow-wrap:anywhere;}
+.phSub{font-size:.7rem;color:var(--ink-dim);letter-spacing:.05em;}
+.ps{padding:1.5rem 1.75rem;border-bottom:1px solid var(--line);}
+.ps:last-child{border-bottom:none;}
+.pst{font-size:.62rem;font-weight:600;text-transform:uppercase;color:var(--ink-dim);letter-spacing:.25em;margin-bottom:1rem;display:flex;justify-content:space-between;align-items:baseline;}
+.trow{display:flex;border:1px solid var(--line2);}
+.tbtn{flex:1;padding:.65rem;border:none;cursor:pointer;font-size:.7rem;font-family:var(--mono);font-weight:500;letter-spacing:.1em;text-transform:uppercase;background:transparent;color:var(--ink-dim);transition:.15s;}
+.tbtn+.tbtn{border-left:1px solid var(--line2);}
+.tbtn.active{background:var(--accent);color:var(--bg);}
+.sg{display:grid;grid-template-columns:1fr 1fr;border:1px solid var(--line);}
+.sc{padding:.85rem 1rem;min-width:0;}
+.sc:nth-child(2),.sc:nth-child(4){border-left:1px solid var(--line);}
+.sc:nth-child(3),.sc:nth-child(4){border-top:1px solid var(--line);}
+.sci{margin-bottom:.4rem;color:var(--accent);display:flex;}
+.scv{font-family:var(--serif);font-size:1.15rem;font-weight:400;color:var(--ink);margin-bottom:.15rem;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;letter-spacing:-.01em;}
+.scl{font-size:.6rem;color:var(--ink-dim);text-transform:uppercase;font-weight:500;letter-spacing:.18em;}
+.pti{margin-bottom:.85rem;}
+.pti:last-child{margin-bottom:0;}
+.pth{display:flex;justify-content:space-between;margin-bottom:.35rem;align-items:baseline;gap:.75rem;}
+.ptn{font-size:.78rem;color:var(--ink);font-family:var(--serif);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;}
+.ptt{font-size:.7rem;color:var(--accent);font-family:var(--mono);font-weight:500;flex-shrink:0;}
+.ptbg{height:2px;background:var(--line);overflow:hidden;}
+.ptb{height:100%;background:var(--accent);width:0;transition:width 1s cubic-bezier(.4,0,.2,1);}
+.ach{display:flex;align-items:center;gap:.85rem;padding:.75rem .85rem;border:1px solid var(--line);margin-bottom:.4rem;transition:.2s;}
+.ach:last-child{margin-bottom:0;}
+.ach.locked{opacity:.3;}
+.ach:not(.locked){border-color:var(--line2);}
+.aci{color:var(--accent);display:flex;flex-shrink:0;}
+.ach.locked .aci{color:var(--ink-dim);}
+.acn{font-family:var(--serif);font-size:.85rem;font-weight:500;color:var(--ink);letter-spacing:-.01em;}
+.acd{font-size:.68rem;color:var(--ink-dim);margin-top:.1rem;letter-spacing:.02em;}
+.ri{display:flex;align-items:center;gap:.6rem;padding:.55rem .25rem;border-bottom:1px dashed var(--line);font-size:.78rem;}
+.ri:last-child{border-bottom:none;}
+.rin{font-family:var(--serif);font-style:italic;color:var(--ink-dim);min-width:1.4rem;font-size:.78rem;}
+.rim{flex:1;color:var(--ink);font-family:var(--serif);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+.rit{font-size:.68rem;color:var(--accent);font-family:var(--mono);flex-shrink:0;}
+.fav-li{display:flex;align-items:center;gap:.55rem;padding:.55rem .25rem;border-bottom:1px dashed var(--line);font-size:.8rem;color:var(--ink);font-family:var(--serif);}
+.fav-li:last-child{border-bottom:none;}
+.fav-li .fav-ico{color:var(--red);display:flex;flex-shrink:0;}
+.empty-msg{color:var(--ink-dim);font-size:.78rem;font-style:italic;font-family:var(--serif);}
+
+/* in-page game overlay */
+#gOver{position:fixed;inset:0;background:#000;z-index:2000;display:none;flex-direction:column;opacity:0;transition:opacity .3s;}
+#gOver.vis{opacity:1;}
+#closeGame{position:absolute;top:1rem;right:1rem;z-index:2001;}
+#closeBtn{background:rgba(244,237,228,.08);color:#f4ede4;border:1px solid rgba(244,237,228,.2);width:40px;height:40px;cursor:pointer;display:grid;place-items:center;backdrop-filter:blur(8px);transition:.15s;padding:0;}
+#closeBtn:hover,#closeBtn:focus-visible{background:#dc2626;border-color:#dc2626;color:#fff;}
+iframe{border:none;flex-grow:1;width:100%;height:100%;opacity:0;transition:opacity .4s;}
+iframe.ld{opacity:1;}
+
+/* footer */
+footer{margin-top:auto;padding-top:1.5rem;border-top:1px solid var(--line);display:flex;justify-content:space-between;gap:1rem;font-size:.62rem;letter-spacing:.18em;color:var(--ink-dim);text-transform:uppercase;}
+
+/* toasts */
+.toast{position:fixed;bottom:1.5rem;left:50%;transform:translateX(-50%) translateY(60px);background:var(--bg);border:1px solid var(--line2);color:var(--ink);padding:.75rem 1.25rem;font-size:.78rem;display:flex;align-items:center;gap:.6rem;font-family:var(--mono);transition:transform .35s cubic-bezier(.34,1.56,.64,1),opacity .3s;opacity:0;white-space:nowrap;max-width:calc(100vw - 2rem);}
+.toast.show{transform:translateX(-50%) translateY(0);opacity:1;}
+.toast::before{content:"";position:absolute;top:-1px;left:-1px;width:24px;height:2px;background:var(--accent);}
+.toast .toast-ico{color:var(--accent);display:flex;}
+.toast-gold .toast-ico{color:var(--accent2);}
+.toast-gold::before{background:var(--accent2);}
+.toast-warn::before{background:var(--red);}
+.toast-warn .toast-ico{color:var(--red);}
+
+/* dialogs: bans, connection loss, launch errors, pop-up blocked */
+.dlg-scrim{background:rgba(12,10,9,.85);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);opacity:0;transition:opacity .2s;}
+body.th-light .dlg-scrim{background:rgba(245,241,234,.85);}
+.dlg-scrim.open{opacity:1;}
+.dlg{position:relative;width:min(480px,100%);background:var(--bg);border:1px solid var(--line2);padding:2.25rem 2rem 1.75rem;transform:translateY(10px);transition:transform .3s cubic-bezier(.34,1.56,.64,1);font-family:var(--mono);color:var(--ink);}
+.dlg-scrim.open .dlg{transform:none;}
+.dlg::before{content:"";position:absolute;top:-1px;left:-1px;width:48px;height:3px;background:var(--accent);}
+.dlg-danger::before{background:var(--red);}
+.dlg-label{display:inline-block;font-size:.62rem;letter-spacing:.25em;text-transform:uppercase;color:var(--accent);border:1px solid var(--accent);padding:.2rem .55rem;margin-bottom:1.25rem;}
+.dlg-danger .dlg-label{color:var(--red);border-color:var(--red);}
+.dlg-warn .dlg-label{color:var(--accent2);border-color:var(--accent2);}
+.dlg-title{font-family:var(--serif);font-weight:300;font-size:2.2rem;line-height:1.05;letter-spacing:-.035em;margin-bottom:.8rem;}
+.dlg-danger .dlg-title{color:var(--red);}
+.dlg-msg{color:var(--ink-dim);font-size:.85rem;max-width:44ch;}
+.dlg-detail{color:var(--ink-dim);font-size:.72rem;max-width:52ch;margin-top:.6rem;opacity:.8;}
+.dlg-code{margin-top:.9rem;}
+.dlg-code code{font-family:var(--mono);font-size:.62rem;letter-spacing:.15em;color:var(--ink-dim);border:1px solid var(--line2);padding:.1rem .45rem;}
+.dlg-actions{display:flex;flex-wrap:wrap;gap:.6rem;margin-top:1.75rem;}
+.btn{font-family:var(--mono);font-size:.8rem;font-weight:600;letter-spacing:.05em;padding:.8rem 1.15rem;border:1px solid var(--line2);background:transparent;color:var(--ink);cursor:pointer;transition:.15s;}
+.btn-primary{background:var(--accent);border-color:var(--accent);color:var(--bg);}
+.btn-primary:hover{background:var(--ink);border-color:var(--ink);}
+.btn-ghost:hover{border-color:var(--accent);color:var(--accent);}
+.btn:disabled{opacity:.6;cursor:progress;}
+@media (prefers-reduced-motion:reduce){*{animation-duration:.01ms !important;animation-iteration-count:1 !important;transition-duration:.01ms !important;}}
+`,
+
+            /* ---- 4e. Pop-out game window ----------------------------------------- */
+            popup: `
+body.bl-popup{margin:0;min-height:100vh;display:grid;place-items:center;background:#0c0a09;color:#f4ede4;font-family:"IBM Plex Mono",ui-monospace,monospace;}
+.pl{display:flex;flex-direction:column;align-items:center;gap:1.1rem;text-align:center;padding:2rem;}
+.pl-sp{width:28px;height:28px;border:2px solid rgba(234,88,12,.25);border-top-color:#ea580c;border-radius:50%;animation:spn .7s linear infinite;}
+.pl-k{font-size:.62rem;letter-spacing:.25em;text-transform:uppercase;color:#ea580c;border:1px solid #ea580c;padding:.2rem .55rem;}
+.pl-t{font-family:"Fraunces",Georgia,serif;font-weight:300;font-size:2rem;letter-spacing:-.03em;}
+@keyframes spn{to{transform:rotate(360deg);}}
+`,
+            popupClose: `
+#bl-popup-close{all:initial;box-sizing:border-box;position:fixed;top:1rem;right:1rem;z-index:2147483647;width:40px;height:40px;display:grid;place-items:center;cursor:pointer;background:rgba(244,237,228,.08);color:#f4ede4;border:1px solid rgba(244,237,228,.2);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);transition:background .15s,border-color .15s;}
+#bl-popup-close:hover,#bl-popup-close:focus-visible{background:#dc2626;border-color:#dc2626;color:#fff;}
+#bl-popup-close svg{display:block;}
+`
+        },
+
+        /* ---- 4f. Markup --------------------------------------------------------- */
+        markup: {
+            login: function () {
+                return '<div class="lroot"><div id="lbg"></div>' +
+                    '<div id="lcard" role="dialog" aria-label="Sign in to the game library">' +
+                    '<div class="llabel">Authentication</div>' +
+                    '<div class="lt">Welcome to the <em>library</em>.</div>' +
+                    '<div class="ls">Enter your credentials to continue.</div>' +
+                    '<label class="lflabel" for="u"><span><span class="lmk">' + ICON.user + '</span> Username</span><span>01</span></label>' +
+                    '<div class="lf"><input id="u" type="text" placeholder="username" autocomplete="off" spellcheck="false" autocapitalize="off">' +
+                    '<span class="lico" aria-hidden="true">' + ICON.userLg + '</span></div>' +
+                    '<label class="lflabel" for="p"><span><span class="lmk">' + ICON.lock + '</span> Password</span><span>02</span></label>' +
+                    '<div class="lf"><input id="p" type="password" placeholder="••••••••">' +
+                    '<button type="button" class="lico" id="eyeBtn" aria-label="Show password">' + ICON.eye + '</button></div>' +
+                    '<button id="lBtn" type="button"><span id="lBtnTxt">Sign In</span><span class="lsp" aria-hidden="true"></span></button>' +
+                    '<div id="lPhase" class="lphase" aria-live="polite"></div>' +
+                    '<div id="lMsg" class="emsg" role="alert"></div>' +
+                    '</div></div>';
+            },
+            restore: function (textHtml) {
+                return '<div class="lroot"><div id="lbg"></div><div class="rest" role="status">' +
+                    '<div class="lsp"></div><div class="rest-t">' + textHtml + '</div><div class="rest-s">Checking your session</div></div></div>';
+            },
+            notice: function (o) {
+                return '<div class="lroot"><div id="lbg"></div><div id="lcard" role="alertdialog" aria-labelledby="nT">' +
+                    '<div class="llabel">Game Library</div><div class="lt" id="nT" style="font-size:2rem">' + o.title + '</div>' +
+                    '<div class="ls">' + o.message + '</div><button id="nClose" class="lbtn" type="button">Close</button></div></div>';
+            },
+            popupLoading: function (nameHtml) {
+                return '<div class="pl" role="status"><div class="pl-k">Game Library</div><div class="pl-sp"></div>' +
+                    '<div class="pl-t">Loading ' + nameHtml + '…</div></div>';
+            },
+            library: function (ctx) {
+                return '<div class="container">' +
+                    '<header><div class="logo">Library<b>.</b></div><div class="nav-right">' +
+                    '<div id="npBadge" aria-live="polite"><div id="npDot"></div><span id="npTxt">Now Playing</span></div>' +
+                    '<div class="umenu"><button type="button" class="uinfo" id="toggleM" aria-haspopup="menu" aria-expanded="false"><span id="uName"></span><div id="pfpCircle"></div></button>' +
+                    '<div class="dd" id="drp" role="menu">' +
+                    '<button type="button" class="di" id="pdMi" role="menuitem">' + ICON.user + '<span>Profile</span></button>' +
+                    '<button type="button" class="di" id="avMi" role="menuitem">' + ICON.img + '<span>Change Avatar</span></button>' +
+                    '<input type="file" id="pfpInp" style="display:none" accept="image/*">' +
+                    '<hr class="ddiv"><button type="button" class="di dred" id="soBtn" role="menuitem">' + ICON.x + '<span>Sign Out</span></button></div></div></div></header>' +
+
+                    '<section class="hero"><div><div class="hero-label">Game Library</div><h1 class="greet" id="wg"></h1><p class="lede" id="ws"></p></div>' +
+                    '<div class="idx" aria-hidden="true">001<small>&mdash; Index</small></div></section>' +
+
+                    '<section class="dg">' +
+                    '<div class="ditem"><div class="dl">Status</div><div class="dv" id="accessStatus" data-state="online" aria-live="polite"><svg xmlns="http://www.w3.org/2000/svg" width="8" height="8" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><circle cx="12" cy="12" r="10"/></svg> <span id="accessText">Online</span></div></div>' +
+                    '<div class="ditem"><div class="dl">Resources</div><div class="dv" id="rCount"></div></div>' +
+                    '<div class="ditem"><div class="dl">System Date</div><div class="dv" id="sDate"></div></div></section>' +
+
+                    '<section class="sw-block"><div class="sw-label"><span><span class="lmk">' + ICON.search + '</span> Search</span><span>Type to filter your library <kbd>/</kbd></span></div>' +
+                    '<div class="sw"><span class="sb-icon">' + ICON.search + '</span><input type="search" id="sb" class="sbar" placeholder="Search games..." autocomplete="off" spellcheck="false" aria-label="Search games">' +
+                    '<button type="button" class="sclr" id="sc" aria-label="Clear search">' + ICON.x + '</button></div></section>' +
+
+                    '<section id="favSec"><div class="slbl"><span><span class="lmk">' + ICON.heart + '</span> Favorites</span><span class="scount" id="favCount"></span></div><div id="favGrid"></div></section>' +
+                    '<section id="recSec"><div class="slbl"><span><span class="lmk">' + ICON.clock + '</span> Recently Played</span><span class="scount" id="recCount"></span></div><div id="recGrid"></div></section>' +
+                    '<section id="allSec"><div class="slbl"><span><span class="lmk">' + ICON.controller + '</span> All Games</span><span class="scount" id="allCount"></span></div><div id="list"></div></section>' +
+                    '<div id="noRes"><div class="nr-title">Nothing found.</div><div class="nr-sub" id="noResSub">Try a different query.</div></div>' +
+                    '<footer><div>GAME LIBRARY &middot; PERSONAL</div><div id="ftYr"></div></footer></div>' +
+
+                    '<div id="pOv"></div><aside id="pPanel" aria-hidden="true" aria-label="Profile">' +
+                    '<div class="ph"><button type="button" class="phClose" id="phClose" aria-label="Close profile">' + ICON.xLg + '</button>' +
+                    '<div class="phLabel"><span class="lmk">' + ICON.user + '</span>User Profile</div>' +
+                    '<div class="phRow"><button type="button" class="phAv" id="phAv" title="Change avatar" aria-label="Change avatar"></button><div><div class="phName" id="phName"></div><div class="phSub" id="phSub"></div></div></div></div>' +
+                    '<div class="ps"><div class="pst"><span><span class="lmk">' + ICON.moon + '</span> Appearance</span><span>01</span></div>' +
+                    '<div class="trow"><button type="button" class="tbtn" data-theme="dark">Dark</button><button type="button" class="tbtn" data-theme="light">Light</button></div></div>' +
+                    '<div class="ps"><div class="pst"><span><span class="lmk">' + ICON.activity + '</span> Stats</span><span>02</span></div><div class="sg" id="sg"></div></div>' +
+                    '<div class="ps"><div class="pst"><span><span class="lmk">' + ICON.chart + '</span> Playtime Breakdown</span><span>03</span></div><div id="ptList"></div></div>' +
+                    '<div class="ps"><div class="pst"><span><span class="lmk">' + ICON.heart + '</span> Favorites</span><span>04</span></div><div id="pFavs"></div></div>' +
+                    '<div class="ps"><div class="pst"><span><span class="lmk">' + ICON.clock + '</span> Recently Played</span><span>05</span></div><div id="pRecent"></div></div>' +
+                    '<div class="ps"><div class="pst"><span><span class="lmk">' + ICON.trophy + '</span> Achievements</span><span>06</span></div><div id="pAch"></div></div></aside>' +
+
+                    '<div id="gOver"><div id="closeGame"><button type="button" id="closeBtn" aria-label="Close game" title="Close game">' + ICON.xLg + '</button></div>' +
+                    '<iframe id="gFrame" allow="autoplay;fullscreen;gamepad" title="Game"></iframe></div>';
+            }
+        }
+    };
+
+    /* ##########################################################################
+     * §5  UI · KIT
+     * --------------------------------------------------------------------------
+     *  Small building blocks every screen uses. They contain no colors or fonts:
+     *  all styling comes from THEME.css.
+     * ########################################################################## */
+    Object.assign(ICON, THEME.icons || {});
+    var COPY = THEME.copy;
+
+    function esc(s) {
+        return String(s).replace(/[&<>"']/g, function (c) {
+            return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c];
+        });
+    }
+    function byId(id, root) { return (root || document).getElementById(id); }
+
+    /* Font stylesheet: added at most once per document. */
+    function ensureFonts() {
+        if (!THEME.fontsHref || document.getElementById('bl-fonts')) return;
+        var link = document.createElement('link');
+        link.id = 'bl-fonts';
+        link.rel = 'stylesheet';
+        link.href = THEME.fontsHref;
+        (document.head || document.documentElement).appendChild(link);
+    }
+
+    /* Full-screen overlay in a shadow root, so the host page's CSS can't leak in.
+     * Used before the library page exists: sign-in, restoring, notices. */
+    function mountShadow(id, html) {
+        ensureFonts();
+        var host = document.createElement('div');
+        host.id = id;
+        host.dataset.edition = THEME.id;
+        host.style.cssText = 'all:initial;position:fixed;inset:0;z-index:2147483647;display:block;';
+        var root = host.attachShadow({ mode: 'open' });
+        root.innerHTML = '<style>' + THEME.css.shadow + '</style>' + html;
+        (document.body || document.documentElement).appendChild(host);
+        return { host: host, root: root };
+    }
+
+    /* A one-button notice for problems found before sign-in (wrong page, old
+     * version still open, failed render). Falls back to alert() if the page
+     * can't host an overlay at all. */
+    function showNotice(title, message) {
+        var old = document.getElementById(HOST_ID.notice);
+        if (old) old.remove();
+        try {
+            var s = mountShadow(HOST_ID.notice, THEME.markup.notice({ title: esc(title), message: esc(message) }));
+            var close = byId('nClose', s.root);
+            close.onclick = function () { s.host.remove(); };
+            close.focus();
+        } catch (_) {
+            alert(title + '\n\n' + message);
+        }
+    }
+
+    /* Turns any auth error into { title, message, code } for display. */
+    var ERROR_TITLES = {
+        INVALID_CREDENTIALS: 'Wrong username or password',
+        PASSWORD_NOT_SET: 'Account not set up',
+        DUPLICATE_USERNAME: 'Account not set up',
+        ACCOUNT_BANNED: 'Account banned',
+        ACCOUNT_DISABLED: 'Account disabled',
+        BROWSER_LOCKED: 'Locked to another browser',
+        RATE_LIMITED: 'Too many attempts',
+        SESSION_REVOKED: 'Signed out',
+        INVALID_SESSION: 'Signed out',
+        INVALID_ORIGIN: 'Open a normal website first',
+        HTTPS_REQUIRED: 'Open a normal website first',
+        STORAGE_ERROR: 'Browser storage is blocked',
+        STALE_REQUEST: 'Check your device clock',
+        TIMEOUT: 'The library didn’t answer',
+        TRANSPORT_ERROR: 'Can’t reach the library',
+        INVALID_REPLY: 'Unexpected reply',
+        SERVER_ERROR: 'Server error'
+    };
+    var ERROR_MESSAGES = {
+        INVALID_CREDENTIALS: 'Check both fields and try again.',
+        ACCOUNT_BANNED: 'This account has been banned. Contact the owner to restore access.'
+    };
+    // Codes that are self-explanatory to players; technical ones keep a code chip
+    // so the owner can look them up.
+    var PLAIN_CODES = ['INVALID_CREDENTIALS', 'ACCOUNT_BANNED', 'ACCOUNT_DISABLED', 'RATE_LIMITED'];
+    function describeError(e) {
+        var code = (e && e.code) || '';
+        return {
+            code: PLAIN_CODES.indexOf(code) >= 0 ? '' : code,
+            rawCode: code,
+            title: (e && e.title) || ERROR_TITLES[code] || 'Sign-in didn’t work',
+            message: ERROR_MESSAGES[code] || (e && e.message) || ''
+        };
+    }
+    function errorHTML(d) {
+        return '<strong class="emsg-t">' + esc(d.title) + '</strong>' +
+            (d.message ? '<span class="emsg-d">' + esc(d.message) + '</span>' : '') +
+            (d.code ? '<code class="emsg-c">' + esc(d.code) + '</code>' : '');
+    }
+
+    /* Modal dialog on the library page (bans, connection loss, launch errors).
+     *   opts: { id, tone: 'danger'|'warn'|'info', label, title, message, detail, code,
+     *           actions: [{ label, kind: 'primary'|'ghost', keepOpen, onClick(btn) }] } */
+    var dialogSeq = 0;
+    function openDialog(opts) {
+        var id = opts.id || HOST_ID.dialog, n = ++dialogSeq;
+        var old = document.getElementById(id);
+        if (old) old.remove();
+        var tone = opts.tone || 'info';
+        var icon = THEME.dialogIcon ? THEME.dialogIcon(tone) : '';
+        var scrim = document.createElement('div');
+        scrim.id = id;
+        scrim.className = 'dlg-scrim';
+        scrim.innerHTML =
+            '<div class="dlg dlg-' + tone + '" role="alertdialog" aria-modal="true" aria-labelledby="dlgT' + n + '" aria-describedby="dlgM' + n + '">' +
+            (icon ? '<div class="dlg-ico">' + icon + '</div>' : '') +
+            (opts.label ? '<div class="dlg-label">' + esc(opts.label) + '</div>' : '') +
+            '<h2 class="dlg-title" id="dlgT' + n + '">' + esc(opts.title || '') + '</h2>' +
+            '<p class="dlg-msg" id="dlgM' + n + '">' + esc(opts.message || '') + '</p>' +
+            (opts.detail ? '<p class="dlg-detail">' + esc(opts.detail) + '</p>' : '') +
+            (opts.code ? '<div class="dlg-code"><code>' + esc(opts.code) + '</code></div>' : '') +
+            '<div class="dlg-actions"></div></div>';
+        var row = scrim.querySelector('.dlg-actions');
+        var api = { el: scrim, close: function () { scrim.remove(); } };
+        (opts.actions || []).forEach(function (a) {
+            var b = document.createElement('button');
+            b.type = 'button';
+            b.className = 'btn ' + (a.kind === 'primary' ? 'btn-primary' : 'btn-ghost');
+            b.textContent = a.label;
+            b.onclick = function () {
+                if (!a.keepOpen) api.close();
+                if (a.onClick) a.onClick(b);
+            };
+            row.appendChild(b);
+        });
+        document.body.appendChild(scrim);
+        requestAnimationFrame(function () { scrim.classList.add('open'); });
+        var focusTarget = row.querySelector('.btn-primary') || row.querySelector('.btn');
+        if (focusTarget) setTimeout(function () { try { focusTarget.focus(); } catch (_) { } }, 30);
+        return api;
+    }
+
+    /* Bottom-of-screen toast. */
+    function toast(msg, icon, tone) {
+        var t = document.createElement('div');
+        t.className = 'toast' + (tone ? ' toast-' + tone : '');
+        t.setAttribute('role', 'status');
+        t.innerHTML = '<span class="toast-ico">' + (icon || ICON.controller) + '</span><span>' + esc(msg) + '</span>';
+        document.body.appendChild(t);
+        requestAnimationFrame(function () { t.classList.add('show'); });
+        setTimeout(function () {
+            t.classList.remove('show');
+            setTimeout(function () { t.remove(); }, 400);
+        }, 2600);
+    }
+
+    /* Rules the app needs whatever the theme looks like (behavior, not style). */
+    var BEHAVIOR_CSS =
+        'body.searching #favSec,body.searching #recSec{display:none !important;}' +
+        '.card .cspin{display:none;}.card.loading .cspin{display:grid;}' +
+        '.card.loading .play{opacity:0 !important;}' +
+        '.sr-only{position:absolute;width:1px;height:1px;padding:0;margin:-1px;overflow:hidden;clip:rect(0 0 0 0);white-space:nowrap;border:0;}' +
+        '.dlg-scrim{position:fixed;inset:0;z-index:2147483000;display:grid;place-items:center;padding:24px;}' +
+        '.toast{z-index:2147483001;}';
+
+    /* Replaces the current page with the library document. */
+    function writeLibraryPage(bodyHtml) {
+        document.open();
+        document.write(
+            '<!DOCTYPE html><html lang="en"><head><meta charset="utf-8"><title>' + esc(COPY.pageTitle) + '</title>' +
+            '<meta name="viewport" content="width=device-width,initial-scale=1">' +
+            '<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>' +
+            '<link id="bl-fonts" href="' + THEME.fontsHref + '" rel="stylesheet">' +
+            '<style>' + THEME.css.library + BEHAVIOR_CSS + '</style></head><body>' + bodyHtml + '</body></html>');
+        document.close();
+    }
+
+    /* Loading screen painted into a pop-out game window while the game downloads. */
+    function paintPopupLoading(win, name) {
+        try {
+            var d = win.document;
+            d.open();
+            d.write('<!DOCTYPE html><html><head><meta charset="utf-8"><title>' + esc(COPY.popupTitle(name)) + '</title>' +
+                '<link href="' + THEME.fontsHref + '" rel="stylesheet"><style>' + THEME.css.popup + '</style></head>' +
+                '<body class="bl-popup">' + THEME.markup.popupLoading(esc(name)) + '</body></html>');
+            d.close();
+        } catch (_) { }
+    }
+
+    /* Close button injected into a pop-out game window. */
+    function addPopupCloseButton(win, onClose) {
+        var d = win.document;
+        if (!d.getElementById('bl-popup-close-css')) {
+            var st = d.createElement('style');
+            st.id = 'bl-popup-close-css';
+            st.textContent = THEME.css.popupClose;
+            (d.head || d.documentElement).appendChild(st);
+        }
+        var btn = d.createElement('button');
+        btn.id = 'bl-popup-close';
+        btn.type = 'button';
+        btn.innerHTML = ICON.xLg;
+        btn.title = COPY.closeGame;
+        btn.setAttribute('aria-label', COPY.closeGame);
+        btn.onclick = onClose;
+        d.body.appendChild(btn);
+    }
+
+    /* ##########################################################################
+     * §6  SCREEN · SIGN-IN  (login form, restoring screen)
+     * ########################################################################## */
+    var auth = null;      // current BookmarkletFormsAuth instance
+    var login = null;     // { host, root } while the sign-in screen is shown
+
+    function showLogin(error) {
+        window.__blFormsOpeningV8 = false;
+        if (login && login.host.isConnected) {
+            if (error) loginError(error);
+            return;
+        }
+        login = mountShadow(HOST_ID.login, THEME.markup.login());
+        var r = login.root;
+        var u = byId('u', r), p = byId('p', r), btn = byId('lBtn', r), eye = byId('eyeBtn', r);
+        var authBusy = false;
+        u.focus();
+        // No saved username or password is ever put into these fields.
+        p.setAttribute('autocomplete', 'off');
+
+        eye.onclick = function () {
+            var show = p.type === 'password';
+            p.type = show ? 'text' : 'password';
+            eye.innerHTML = show ? ICON.eyeOff : ICON.eye;
+            eye.setAttribute('aria-label', show ? 'Hide password' : 'Show password');
+            p.focus();
+        };
+        u.onkeydown = function (e) { if (e.key === 'Enter') p.focus(); };
+        p.onkeydown = function (e) { if (e.key === 'Enter') btn.click(); };
+
+        function setLoading(on) {
+            btn.disabled = on;
+            btn.classList.toggle('busy', on);
+            byId('lBtnTxt', r).textContent = on ? COPY.signingIn : COPY.signIn;
+            u.disabled = on;
+            p.disabled = on;
+            setPhase(on ? COPY.phase['Preparing request'] || '' : '');
+        }
+        function setPhase(text) {
+            var el = byId('lPhase', r);
+            el.textContent = text;
+            el.classList.toggle('on', !!text);
+        }
+
+        btn.onclick = async function () {
+            if (authBusy) return;
+            var username = u.value.trim();
+            var password = p.value;
+            if (!username || !password) {
+                loginError({ title: COPY.missingFields });
+                (username ? p : u).focus();
+                return;
+            }
+            authBusy = true;
+            setLoading(true);
+            hideLoginError();
+            auth.onProgress = function (ev) {
+                if (login) setPhase(COPY.phase[ev.phase] || ev.phase);
+            };
+            try {
+                var approved = await auth.login(username, password);
+                auth.onProgress = null;
+                closeLogin();
+                loadLibrary(approved.games, username, Date.now(), false);
+            } catch (e) {
+                if (login) {
+                    loginError(e);
+                } else {
+                    console.error('Library render failed', e && e.stack || e);
+                    showNotice(COPY.openFailedTitle, (e && e.message) || String(e));
+                }
+            } finally {
+                auth.onProgress = null;
+                password = '';
+                if (login) {
+                    p.value = '';
+                    setLoading(false);
+                    (u.value.trim() ? p : u).focus();
+                }
+                authBusy = false;
+            }
+        };
+        if (error) loginError(error);
+    }
+
+    function loginError(e) {
+        if (!login) return;
+        var d = describeError(e), box = byId('lMsg', login.root);
+        box.className = 'emsg on' + (d.rawCode === 'ACCOUNT_BANNED' ? ' banned' : '');
+        box.innerHTML = errorHTML(d);
+        // Restart the shake animation on repeat errors.
+        void box.offsetWidth;
+        box.classList.add('shake');
+    }
+    function hideLoginError() {
+        if (login) byId('lMsg', login.root).className = 'emsg';
+    }
+    function closeLogin() {
+        if (login) login.host.remove();
+        login = null;
+    }
+
+    /* Shown while an older saved session (no cached game list) is re-checked. */
+    var restoring = null;
+    function showRestoring() {
+        restoring = mountShadow(HOST_ID.restore, THEME.markup.restore(esc(COPY.restoring)));
+    }
+    function hideRestoring() {
+        if (restoring) restoring.host.remove();
+        restoring = null;
+    }
+
+    /* ##########################################################################
+     * §7  SCREEN · LIBRARY
+     * --------------------------------------------------------------------------
+     *  loadLibrary() replaces the page with the library and owns everything
+     *  that lives on it. Its parts:
+     *     7a  local data      playtime, favorites, recents, avatar, prefs
+     *     7b  page + header   write the page, fill in names and counts
+     *     7c  profile panel   stats, playtime, achievements, appearance
+     *     7d  game grid       cards, sections, search
+     *  §8  access control and §9 game loader are also inside, further down.
+     * ########################################################################## */
+    function loadLibrary(games, userName, startTime, resumed) {
+        var gCount = Object.keys(games).length;
+        var K = storageKeys(userName);
+
+        /* ---- 7a. Local data ---------------------------------------------------- */
+        function readJSON(key, fallback) {
+            try { var v = JSON.parse(localStorage.getItem(key)); return v == null ? fallback : v; }
+            catch (_) { return fallback; }
+        }
+        function writeJSON(key, value) {
+            try { localStorage.setItem(key, JSON.stringify(value)); } catch (_) { }
+        }
+        if (!localStorage.getItem(K.member)) localStorage.setItem(K.member, Date.now().toString());
+
+        // Playtime that an instrumented game reported while the library was closed
+        // (ignored if older than two hours).
+        (function () {
+            var d = readJSON(TIME_DELTA_KEY, null);
+            if (!d) return;
+            if (d.name && d.ms && (Date.now() - (d.ts || 0)) < 2 * 60 * 60 * 1000) {
+                var s = getStats();
+                s[d.name] = (s[d.name] || 0) + d.ms;
+                writeJSON(K.stats, s);
+            }
+            localStorage.removeItem(TIME_DELTA_KEY);
+        })();
+
+        function getStats() { var s = readJSON(K.stats, {}); return s && typeof s === 'object' ? s : {}; }
+        function addPlaytime(name, ms) {
+            if (!name || ms < 500) return;
+            var s = getStats();
+            s[name] = (s[name] || 0) + ms;
+            writeJSON(K.stats, s);
+        }
+        function getFavorites() { var f = readJSON(K.favorites, []); return Array.isArray(f) ? f : []; }
+        function isFavorite(n) { return getFavorites().indexOf(n) > -1; }
+        function toggleFavorite(n) {
+            var f = getFavorites(), i = f.indexOf(n);
+            if (i > -1) f.splice(i, 1); else f.unshift(n);
+            writeJSON(K.favorites, f);
+        }
+        function getRecent() { var r = readJSON(K.recent, []); return Array.isArray(r) ? r : []; }
+        function pushRecent(n) {
+            var r = getRecent().filter(function (x) { return x !== n; });
+            r.unshift(n);
+            writeJSON(K.recent, r.slice(0, 10));
+        }
+        function totalPlaytime() {
+            return Object.values(getStats()).reduce(function (a, b) { return a + b; }, 0);
+        }
+        function topGame() {
+            var s = getStats(), k = Object.keys(s);
+            return k.length ? k.reduce(function (a, b) { return s[a] > s[b] ? a : b; }) : null;
+        }
+        function formatDuration(ms) {
+            var s = Math.floor(ms / 1000), h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sc = s % 60;
+            if (h > 0) return h + 'h ' + m + 'm';
+            if (m > 0) return m + 'm ' + sc + 's';
+            return sc > 0 ? sc + 's' : '<1s';
+        }
+
+        // Achievement rules are shared; their names come from the theme's copy.
+        function achievements() {
+            var s = getStats(), tot = totalPlaytime(), fv = getFavorites(), rc = getRecent();
+            var played = Object.keys(s).length;
+            var rules = [
+                { icon: ICON.controller, u: rc.length >= 1 },
+                { icon: ICON.controller, u: played >= 3 },
+                { icon: ICON.controller, u: played >= 5 },
+                { icon: ICON.clock, u: tot >= 3600000 },
+                { icon: ICON.clock, u: tot >= 18000000 },
+                { icon: ICON.heart, u: fv.length >= 3 },
+                { icon: ICON.heart, u: fv.length >= 5 },
+                { icon: ICON.star, u: rc.length >= 10 }
+            ];
+            return rules.map(function (r, i) {
+                return { icon: r.icon, u: r.u, name: COPY.achievements[i][0], desc: COPY.achievements[i][1] };
+            });
+        }
+        function announceAchievements(prev) {
+            achievements().forEach(function (a, i) {
+                if (a.u && !prev[i].u) setTimeout(function () { toast(COPY.achievementToast(a.name), ICON.trophy, 'gold'); }, 400);
+            });
+        }
+
+        /* ---- 7b. Page, header and hero ------------------------------------------ */
+        writeLibraryPage(THEME.markup.library({ user: esc(userName), count: gCount }));
+
+        function paintCounts() {
+            byId('rCount').textContent = COPY.resourceCount(gCount);
+            byId('ws').textContent = COPY.lede(gCount);
+            byId('ftYr').textContent = COPY.footerRight(gCount);
+            byId('sb').placeholder = COPY.searchPlaceholder(gCount);
+        }
+        paintCounts();
+        byId('sDate').textContent = COPY.dateValue(new Date());
+        byId('uName').textContent = userName;
+        byId('phName').textContent = userName;
+        byId('wg').innerHTML = COPY.greeting(new Date().getHours(), esc(userName));
+        var memberSince = new Date(parseInt(localStorage.getItem(K.member), 10))
+            .toLocaleDateString('en-US', { month: 'long', year: 'numeric' });
+        byId('phSub').textContent = COPY.memberSince(memberSince);
+
+        /* Status pill / cell: online, reconnecting, paused, banned, signin. */
+        function setAccessState(state) {
+            var el = byId('accessStatus'), txt = byId('accessText');
+            if (el) el.dataset.state = state;
+            if (txt) txt.textContent = COPY.status[state] || state;
+        }
+        setAccessState('online');
+
+        /* Appearance (theme variants) and the optional effects switch. */
+        function applyAppearance(id) {
+            var ids = THEME.appearances.map(function (a) { return a.id; });
+            if (ids.indexOf(id) < 0) id = ids[0];
+            ids.forEach(function (a) { document.body.classList.toggle('th-' + a, a === id); });
+            try { localStorage.setItem(K.appearance, id); } catch (_) { }
+            document.querySelectorAll('.tbtn[data-theme]').forEach(function (b) {
+                var on = b.dataset.theme === id;
+                b.classList.toggle('active', on);
+                b.setAttribute('aria-pressed', String(on));
+            });
+        }
+        function applyEffects(on) {
+            document.body.classList.toggle('fx-off', !on);
+            try { localStorage.setItem(K.effects, on ? 'on' : 'off'); } catch (_) { }
+            document.querySelectorAll('.tbtn[data-fx]').forEach(function (b) {
+                var active = (b.dataset.fx === 'on') === on;
+                b.classList.toggle('active', active);
+                b.setAttribute('aria-pressed', String(active));
+            });
+        }
+        applyAppearance(localStorage.getItem(K.appearance) || THEME.appearances[0].id);
+        applyEffects(localStorage.getItem(K.effects) !== 'off');
+        document.querySelectorAll('.tbtn[data-theme]').forEach(function (b) {
+            b.onclick = function () { applyAppearance(b.dataset.theme); };
+        });
+        document.querySelectorAll('.tbtn[data-fx]').forEach(function (b) {
+            b.onclick = function () { applyEffects(b.dataset.fx === 'on'); };
+        });
+
+        /* Avatar: stored as a ≤256 px JPEG data URL. */
+        function renderAvatar() {
+            var p = localStorage.getItem(K.avatar), c = byId('pfpCircle'), a = byId('phAv');
+            if (p && /^data:image\/(jpeg|png|webp);base64,/.test(p)) {
+                c.innerHTML = '<img src="' + esc(p) + '" alt="">';
+                a.innerHTML = '<img src="' + esc(p) + '" alt="">';
+            } else {
+                c.textContent = userName.charAt(0).toUpperCase();
+                a.textContent = userName.charAt(0).toUpperCase();
+            }
+        }
+        renderAvatar();
+        byId('pfpInp').onchange = function (e) {
+            var f = e.target.files[0];
+            e.target.value = '';
+            if (!f) return;
+            if (!/^image\//.test(f.type)) { toast(COPY.avatarNotImage, ICON.img, 'warn'); return; }
+            var reader = new FileReader();
+            reader.onloadend = function () {
+                var img = new Image();
+                img.onload = function () {
+                    var max = 256, w = img.width, h = img.height, canvas = document.createElement('canvas');
+                    if (w > h) { if (w > max) { h = h * (max / w); w = max; } }
+                    else if (h > max) { w = w * (max / h); h = max; }
+                    canvas.width = w;
+                    canvas.height = h;
+                    canvas.getContext('2d').drawImage(img, 0, 0, w, h);
+                    try {
+                        localStorage.setItem(K.avatar, canvas.toDataURL('image/jpeg', 0.85));
+                        renderAvatar();
+                        toast(COPY.avatarSaved, ICON.img);
+                    } catch (err) {
+                        toast(COPY.avatarTooLarge, ICON.img, 'warn');
+                    }
+                };
+                img.onerror = function () { toast(COPY.avatarNotImage, ICON.img, 'warn'); };
+                img.src = reader.result;
+            };
+            reader.readAsDataURL(f);
+        };
+
+        /* Header user menu. */
+        var drp = byId('drp'), menuBtn = byId('toggleM');
+        function setMenu(open) {
+            drp.classList.toggle('open', open);
+            menuBtn.setAttribute('aria-expanded', String(open));
+        }
+        menuBtn.onclick = function (e) { e.stopPropagation(); setMenu(!drp.classList.contains('open')); };
+        byId('pdMi').onclick = function () { openPanel(); };
+        byId('avMi').onclick = function () { byId('pfpInp').click(); setMenu(false); };
+        byId('soBtn').onclick = function () { signOutLibrary(); };
+        window.onclick = function () { setMenu(false); };
+
+        /* ---- 7c. Profile panel ------------------------------------------------- */
+        function renderPanel() {
+            var st = getStats(), tot = totalPlaytime(), fv = getFavorites(), rc = getRecent(), mp = topGame();
+            byId('sg').innerHTML =
+                '<div class="sc"><div class="sci">' + ICON.clock + '</div><div class="scv">' + formatDuration(tot) + '</div><div class="scl">' + COPY.statLabels[0] + '</div></div>' +
+                '<div class="sc"><div class="sci">' + ICON.controller + '</div><div class="scv">' + Object.keys(st).length + '</div><div class="scl">' + COPY.statLabels[1] + '</div></div>' +
+                '<div class="sc"><div class="sci">' + ICON.star + '</div><div class="scv" title="' + esc(mp || '') + '">' + esc(mp || '—') + '</div><div class="scl">' + COPY.statLabels[2] + '</div></div>' +
+                '<div class="sc"><div class="sci">' + ICON.heart + '</div><div class="scv">' + fv.length + '</div><div class="scl">' + COPY.statLabels[3] + '</div></div>';
+
+            var top = Object.entries(st).sort(function (a, b) { return b[1] - a[1]; }).slice(0, 6);
+            byId('ptList').innerHTML = top.length ? top.map(function (e) {
+                return '<div class="pti"><div class="pth"><span class="ptn">' + esc(e[0]) + '</span><span class="ptt">' + formatDuration(e[1]) +
+                    '</span></div><div class="ptbg"><div class="ptb" data-w="' + Math.round(e[1] / top[0][1] * 100) + '%"></div></div></div>';
+            }).join('') : '<div class="empty-msg">' + COPY.empty.playtime + '</div>';
+            setTimeout(function () {
+                document.querySelectorAll('.ptb').forEach(function (b) { b.style.width = b.dataset.w; });
+            }, 60);
+
+            byId('pFavs').innerHTML = fv.length ? fv.map(function (n) {
+                return '<div class="fav-li"><span class="fav-ico">' + ICON.heartFill + '</span><span>' + esc(n) + '</span></div>';
+            }).join('') : '<div class="empty-msg">' + COPY.empty.favorites + '</div>';
+
+            byId('pRecent').innerHTML = rc.length ? rc.slice(0, 5).map(function (n, i) {
+                var t = st[n] ? formatDuration(st[n]) : '';
+                return '<div class="ri"><span class="rin">' + COPY.recentIndex(i) + '</span><span class="rim">' + esc(n) + '</span>' +
+                    (t ? '<span class="rit">' + t + '</span>' : '') + '</div>';
+            }).join('') : '<div class="empty-msg">' + COPY.empty.recent + '</div>';
+
+            byId('pAch').innerHTML = achievements().map(function (a) {
+                return '<div class="ach' + (a.u ? '' : ' locked') + '"><div class="aci">' + a.icon + '</div><div><div class="acn">' +
+                    esc(a.name) + '</div><div class="acd">' + esc(a.desc) + '</div></div></div>';
+            }).join('');
+        }
+        function openPanel() {
+            renderPanel();
+            byId('pPanel').classList.add('open');
+            byId('pOv').classList.add('open');
+            byId('pPanel').setAttribute('aria-hidden', 'false');
+            setMenu(false);
+            setTimeout(function () { byId('phClose').focus(); }, 50);
+        }
+        function closePanel() {
+            byId('pPanel').classList.remove('open');
+            byId('pOv').classList.remove('open');
+            byId('pPanel').setAttribute('aria-hidden', 'true');
+        }
+        byId('phClose').onclick = closePanel;
+        byId('pOv').onclick = closePanel;
+        byId('phAv').onclick = function () { byId('pfpInp').click(); };
+
+        /* ---- 7d. Game grid: cards, sections, search ----------------------------- */
+        var sbEl = byId('sb'), scEl = byId('sc');
+        sbEl.oninput = function () {
+            scEl.classList.toggle('on', sbEl.value.length > 0);
+            doFilter();
+        };
+        scEl.onclick = function () {
+            sbEl.value = '';
+            scEl.classList.remove('on');
+            doFilter();
+            sbEl.focus();
+        };
+        function doFilter() {
+            var q = sbEl.value.trim().toLowerCase(), visible = 0;
+            document.body.classList.toggle('searching', q.length > 0);
+            document.querySelectorAll('#list .card').forEach(function (c) {
+                var show = c.dataset.name.toLowerCase().indexOf(q) > -1;
+                c.style.display = show ? '' : 'none';
+                if (show) visible++;
+            });
+            byId('allCount').textContent = q ? COPY.count(visible) + ' / ' + COPY.count(gCount) : COPY.count(gCount);
+            var none = visible === 0 && q.length > 0;
+            byId('noRes').style.display = none ? 'block' : 'none';
+            if (none) byId('noResSub').textContent = COPY.noResultsSub(sbEl.value.trim());
+        }
+
+        // Keyboard: "/" focuses search, Escape closes the panel/menu or clears search.
+        document.addEventListener('keydown', function (e) {
+            var tag = (e.target && e.target.tagName) || '';
+            if (e.key === '/' && !/INPUT|TEXTAREA|SELECT/.test(tag) && !e.target.isContentEditable) {
+                e.preventDefault();
+                sbEl.focus();
+            } else if (e.key === 'Escape') {
+                if (byId('pPanel').classList.contains('open')) closePanel();
+                else if (drp.classList.contains('open')) setMenu(false);
+                else if (e.target === sbEl && sbEl.value) scEl.click();
+            }
+        });
+
+        function makeCard(name, gd, container, withHeart, index, animate) {
+            var c = document.createElement('div');
+            c.className = 'card' + (withHeart ? ' has-fav' : '') + (animate ? ' rise' : '');
+            c.dataset.name = name;
+            c.tabIndex = 0;
+            c.setAttribute('role', 'button');
+            c.setAttribute('aria-label', COPY.playLabel(name));
+            c.style.setProperty('--i', String(Math.min(index, 18)));
+            var fav = withHeart && isFavorite(name);
+            c.innerHTML =
+                (withHeart ? '<button type="button" class="hrt' + (fav ? ' on' : '') + '" data-g="' + esc(name) + '" aria-pressed="' + fav +
+                    '" aria-label="' + esc(COPY.favLabel(name)) + '" title="' + esc(COPY.favLabel(name)) + '">' + (fav ? ICON.heartFill : ICON.heart) + '</button>' : '') +
+                '<div class="ib"><span class="mono" aria-hidden="true">' + esc(name.charAt(0).toUpperCase()) + '</span>' +
+                (gd.icon ? '<img alt="" loading="lazy" src="https://drive.google.com/uc?export=view&amp;id=' + encodeURIComponent(gd.icon) + '">' : '') +
+                '<div class="play">' + ICON.play + '</div><div class="cspin" aria-hidden="true"><i></i></div></div>' +
+                '<div class="cn">' + esc(name) + '</div>';
+            var image = c.querySelector('img');
+            if (image) {
+                image.onload = function () { this.classList.add('ok'); };
+                image.onerror = function () { this.remove(); };
+            }
+            if (withHeart) {
+                c.querySelector('.hrt').onclick = function (e) {
+                    e.stopPropagation();
+                    toggleFavorite(name);
+                    var on = isFavorite(name);
+                    document.querySelectorAll('.hrt').forEach(function (h) {
+                        if (h.dataset.g === name) {
+                            h.classList.toggle('on', on);
+                            h.setAttribute('aria-pressed', String(on));
+                            h.innerHTML = on ? ICON.heartFill : ICON.heart;
+                        }
+                    });
+                    renderFavorites(false);
+                    toast(on ? COPY.favAdded : COPY.favRemoved, on ? ICON.heartFill : ICON.heart);
+                };
+            }
+            c.onclick = function () { launchGame(name, gd); };
+            c.onkeydown = function (e) {
+                if (e.target !== c) return;
+                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); launchGame(name, gd); }
+            };
+            var hoverTimer;
+            c.onmouseenter = function () {
+                hoverTimer = setTimeout(function () { if (!accessBlocked) prefetchGame(gd); }, 150);
+            };
+            c.onmouseleave = function () { clearTimeout(hoverTimer); };
+            container.appendChild(c);
+        }
+        function renderFavorites(animate) {
+            var fv = getFavorites().filter(function (n) { return !!games[n]; });
+            var sec = byId('favSec'), grid = byId('favGrid');
+            if (!fv.length) { sec.style.display = 'none'; return; }
+            sec.style.display = 'block';
+            grid.innerHTML = '';
+            fv.forEach(function (n, i) { makeCard(n, games[n], grid, false, i, animate); });
+            byId('favCount').textContent = COPY.count(fv.length);
+        }
+        function renderRecent(animate) {
+            var rc = getRecent().filter(function (n) { return !!games[n]; }).slice(0, 6);
+            var sec = byId('recSec'), grid = byId('recGrid');
+            if (!rc.length) { sec.style.display = 'none'; return; }
+            sec.style.display = 'block';
+            grid.innerHTML = '';
+            rc.forEach(function (n, i) { makeCard(n, games[n], grid, false, i, animate); });
+            byId('recCount').textContent = COPY.count(rc.length);
+        }
+        function renderAll(animate) {
+            var list = byId('list');
+            byId('allSec').style.display = 'block';
+            list.innerHTML = '';
+            Object.keys(games).forEach(function (name, i) { makeCard(name, games[name], list, true, i, animate); });
+            byId('allCount').textContent = COPY.count(gCount);
+        }
+        function setCardLoading(name, on) {
+            document.querySelectorAll('.card').forEach(function (c) {
+                if (c.dataset.name === name) {
+                    c.classList.toggle('loading', on);
+                    c.setAttribute('aria-busy', String(on));
+                }
+            });
+        }
+
+        /* In-page game overlay. */
+        var overlay = byId('gOver'), frame = byId('gFrame');
+        var curGame = null, curStart = null, writeGameOpen = false;
+        function saveCurrentTime() {
+            if (curGame && curStart) {
+                addPlaytime(curGame, Date.now() - curStart);
+                curStart = null;
+            }
+        }
+        window.addEventListener('beforeunload', saveCurrentTime);
+        function consumeTimeDelta() {
+            var d = readJSON(TIME_DELTA_KEY, null);
+            if (d && d.name && d.ms) {
+                var prev = achievements();
+                addPlaytime(d.name, d.ms);
+                localStorage.removeItem(TIME_DELTA_KEY);
+                announceAchievements(prev);
+            }
+        }
+        var deltaTimer = setInterval(consumeTimeDelta, 2000);
+        function setNowPlaying(name) {
+            var badge = byId('npBadge'), txt = byId('npTxt');
+            if (badge) badge.classList.toggle('on', !!name);
+            if (txt && name) txt.textContent = COPY.nowPlaying(name);
+            document.body.classList.toggle('playing', !!name);
+        }
+        byId('closeBtn').onclick = function () {
+            var prev = achievements();
+            saveCurrentTime();
+            curGame = null;
+            announceAchievements(prev);
+            overlay.classList.remove('vis');
+            setNowPlaying(null);
+            var closeGeneration = ++gameGeneration;
+            setTimeout(function () {
+                if (closeGeneration !== gameGeneration) return;
+                overlay.style.display = 'none';
+                frame.classList.remove('ld');
+                frame.srcdoc = '';
+                document.body.style.overflow = 'auto';
+            }, 300);
+        };
+
+        /* ##########################################################################
+         * §8  LOGIC · ACCESS CONTROL  (bans, revocations, reconnects, sign-out)
+         * --------------------------------------------------------------------------
+         *  The library opens from the last accepted session and re-checks in the
+         *  background, so launching a game never waits on Google Forms.
+         *  A confirmed ban/revocation closes running games. Enforcement is
+         *  eventual (next heartbeat / focus), not instantaneous.
+         * ########################################################################## */
+        var launchBusy = false, accessBlocked = false, disposed = false, gameGeneration = 0;
+        var gameWindows = new Set(), gameControllers = new Set(), accessCheck = null;
+        var terminalAccessError = null;
+        var openedSession = auth._saved(), lastVerified = openedSession && openedSession.lastVerifiedAt || Date.now();
+        var sessionTokenAtOpen = openedSession && openedSession.sessionToken;
+        var expiryTimer = null, focusHandler = null, storageHandler = null;
+
+        function closeRunningGames() {
+            gameGeneration++;
+            saveCurrentTime();
+            curGame = null;
+            writeGameOpen = false;
+            gameControllers.forEach(function (c) { c.abort(); });
+            gameControllers.clear();
+            if (frame) {
+                frame.srcdoc = '';
+                frame.removeAttribute('src');
+            }
+            if (overlay) {
+                overlay.classList.remove('vis');
+                overlay.style.display = 'none';
+            }
+            document.body.style.overflow = 'auto';
+            setNowPlaying(null);
+            gameWindows.forEach(function (w) {
+                try { if (!w.closed) w.close(); } catch (_) { }
+            });
+            gameWindows.clear();
+        }
+
+        function acceptAccess(result) {
+            if (disposed || terminalAccessError) return;
+            accessBlocked = false;
+            var cached = auth._saved();
+            lastVerified = cached && cached.lastVerifiedAt || Date.now();
+            var panel = byId(HOST_ID.block);
+            if (panel) panel.remove();
+            setAccessState('online');
+            // The owner changed the catalog: re-render with the new list.
+            if (result && result.games && JSON.stringify(result.games) !== JSON.stringify(games)) {
+                games = result.games;
+                gCount = Object.keys(games).length;
+                paintCounts();
+                renderFavorites(false);
+                renderRecent(false);
+                renderAll(false);
+                doFilter();
+            }
+        }
+
+        function disposeLibrary() {
+            if (disposed) return;
+            disposed = true;
+            auth.stopHeartbeat();
+            auth.cancelPendingRequests();
+            clearInterval(deltaTimer);
+            clearInterval(expiryTimer);
+            window.removeEventListener('beforeunload', saveCurrentTime);
+            if (focusHandler) window.removeEventListener('focus', focusHandler);
+            if (storageHandler) window.removeEventListener('storage', storageHandler);
+            if (window.__blLibraryV8) window.__blLibraryV8 = null;
+        }
+
+        function returnToSignIn(reason) {
+            closeRunningGames();
+            disposeLibrary();
+            try { auth.storage.removeItem(auth.sessionName); } catch (_) { }
+            var panel = byId(HOST_ID.block);
+            if (panel) panel.remove();
+            delete document.body.dataset.formsLibrary;
+            auth = new window.BookmarkletFormsAuth(auth.config);
+            showLogin(reason);
+        }
+
+        /* Locks the library behind a dialog.
+         *   banned    → "Account banned", no retry (ban notices never offer one)
+         *   permanent → "Sign-in required" (revoked, expired, browser-locked …)
+         *   otherwise → "Access paused" with "Retry connection" (network trouble) */
+        function blockAccess(error) {
+            if (disposed || terminalAccessError) return;
+            var code = error && error.code;
+            var banned = code === 'ACCOUNT_BANNED';
+            var permanent = DENY_CODES.indexOf(code) >= 0;
+            if (permanent) {
+                terminalAccessError = error;
+                // Stop the heartbeat so a later INVALID_SESSION can't replace the
+                // ban notice after the auth client removes the rejected session.
+                auth.stopHeartbeat();
+            }
+            accessBlocked = true;
+            closeRunningGames();
+            closePanel();
+            var kind = banned ? 'banned' : permanent ? 'signin' : 'paused';
+            setAccessState(kind);
+            var A = COPY.access[kind], actions = [];
+            if (!permanent) {
+                actions.push({
+                    label: COPY.access.retry, kind: 'primary', keepOpen: true,
+                    onClick: function (btn) {
+                        btn.disabled = true;
+                        btn.textContent = COPY.access.retrying;
+                        verifyAccess().finally(function () {
+                            btn.disabled = false;
+                            btn.textContent = COPY.access.retry;
+                        });
+                    }
+                });
+            }
+            actions.push({
+                label: banned ? COPY.access.useAnother : COPY.access.signIn,
+                kind: permanent ? 'primary' : 'ghost',
+                onClick: function () { returnToSignIn(); }
+            });
+            // Themes with friendlyMessages show their own sentence and keep the
+            // server's technical text as a small detail line.
+            var serverText = error && error.message || '';
+            var friendly = !!COPY.access.friendlyMessages;
+            openDialog({
+                id: HOST_ID.block,
+                tone: banned ? 'danger' : permanent ? 'warn' : 'info',
+                label: A.label,
+                title: A.title,
+                message: banned || friendly ? A.message : serverText || A.message,
+                detail: !banned && friendly ? serverText : '',
+                code: banned ? '' : code,
+                actions: actions
+            });
+        }
+
+        function failedAccess(error) {
+            if (disposed || terminalAccessError || error && error.code === 'CANCELLED') return;
+            if (DENY_CODES.indexOf(error && error.code) >= 0) {
+                blockAccess(error);
+                return;
+            }
+            // Network failures never erase the session or turn into "wrong password".
+            // A long outage pauses play but keeps the saved session for a retry.
+            setAccessState('reconnecting');
+            if (Date.now() - lastVerified > TIMING.offlineGraceMs) blockAccess(error);
+        }
+
+        function verifyAccess() {
+            if (disposed || terminalAccessError) return Promise.resolve(null);
+            if (accessCheck) return accessCheck;
+            accessCheck = auth.check(true)
+                .then(function (r) { acceptAccess(r); return r; })
+                .catch(function (e) { failedAccess(e); return null; })
+                .finally(function () { accessCheck = null; });
+            return accessCheck;
+        }
+
+        function canLaunch() {
+            if (disposed || accessBlocked) return false;
+            var saved = auth._saved();
+            if (!auth._validSession(saved) || saved.sessionToken !== sessionTokenAtOpen) {
+                blockAccess(Object.assign(new Error('Your saved session expired or was signed out.'), { code: 'INVALID_SESSION' }));
+                return false;
+            }
+            return true;
+        }
+
+        function signOutLibrary() {
+            var previousAuth = auth;
+            closeRunningGames();
+            disposeLibrary();
+            // Local sign-out is instant; the server-side revoke runs in the background.
+            previousAuth.logout().catch(function () { });
+            delete document.body.dataset.formsLibrary;
+            auth = new window.BookmarkletFormsAuth(previousAuth.config);
+            showLogin();
+        }
+
+        /* ##########################################################################
+         * §9  LOGIC · GAME LOADER  (download + cache, in-page overlay, pop-outs)
+         * ########################################################################## */
+        var assetCache = new Map(), assetPending = new Map(), assetBytes = 0;
+
+        function fetchGame(gd) {
+            var url = String(gd.url || '');
+            if (!/^https:\/\//i.test(url)) return Promise.reject(new Error('The game URL must use HTTPS.'));
+            if (assetCache.has(url)) return Promise.resolve(assetCache.get(url));
+            if (assetPending.has(url)) return assetPending.get(url);
+            var controller = new AbortController(), timer;
+            gameControllers.add(controller);
+            var job = Promise.race([
+                (async function () {
+                    var res = await fetch(url, { signal: controller.signal });
+                    if (!res.ok) throw new Error('Game download failed (HTTP ' + res.status + ').');
+                    return await res.text();
+                })(),
+                new Promise(function (_, reject) {
+                    timer = setTimeout(function () {
+                        controller.abort();
+                        reject(new Error('Game download timed out.'));
+                    }, TIMING.gameDownloadMs);
+                })
+            ]).then(function (html) {
+                // Cache small HTML launchers only, never huge embedded game bundles.
+                var size = html.length * 2;
+                if (size <= GAME_CACHE.maxItemBytes) {
+                    while (assetBytes + size > GAME_CACHE.maxTotalBytes && assetCache.size) {
+                        var oldest = assetCache.keys().next().value;
+                        assetBytes -= assetCache.get(oldest).length * 2;
+                        assetCache.delete(oldest);
+                    }
+                    if (!assetCache.has(url)) {
+                        assetCache.set(url, html);
+                        assetBytes += size;
+                    }
+                }
+                return html;
+            }).finally(function () {
+                clearTimeout(timer);
+                gameControllers.delete(controller);
+                assetPending.delete(url);
+            });
+            assetPending.set(url, job);
+            return job;
+        }
+
+        function prefetchGame(gd) {
+            if (disposed || accessBlocked || assetPending.size >= 2) return;
+            fetchGame(gd).catch(function () { });
+        }
+
+        // "iframe" games on google.* pages pop out to the site's own origin first.
+        function waitForPopup(nw, googleHost) {
+            if (!googleHost) return Promise.resolve();
+            return new Promise(function (resolve, reject) {
+                var until = Date.now() + TIMING.popupHostWaitMs;
+                (function ready() {
+                    if (nw.closed) { reject(new Error('The game window was closed.')); return; }
+                    try {
+                        if (nw.location.href !== 'about:blank' && nw.document.readyState === 'complete') { resolve(); return; }
+                    } catch (_) { }
+                    if (Date.now() >= until) { reject(new Error('The game host page did not finish loading.')); return; }
+                    setTimeout(ready, 50);
+                })();
+            });
+        }
+
+        function showPopupBlocked(name, gd) {
+            openDialog({
+                tone: 'info', label: COPY.popupBlocked.label, title: COPY.popupBlocked.title,
+                message: COPY.popupBlocked.message(name),
+                actions: [
+                    { label: COPY.tryAgain, kind: 'primary', onClick: function () { launchGame(name, gd); } },
+                    { label: COPY.close, kind: 'ghost' }
+                ]
+            });
+        }
+
+        // A download/asset failure is not an authentication failure.
+        function launchFailure(error, name, gd) {
+            openDialog({
+                tone: 'warn', label: COPY.launchFailed.label, title: COPY.launchFailed.title(name),
+                message: error && error.message ? error.message : COPY.launchFailed.fallback,
+                actions: [
+                    { label: COPY.tryAgain, kind: 'primary', onClick: function () { launchGame(name, gd); } },
+                    { label: COPY.close, kind: 'ghost' }
+                ]
+            });
+        }
+
+        async function launchGame(name, gd) {
+            if (launchBusy || !canLaunch()) return;
+            launchBusy = true;
+            setCardLoading(name, true);
+            var nw = null, mounted = false, generation = ++gameGeneration;
+            var separate = gd.type === 'write' || gd.type === 'iframe';
+            var googleHost = gd.type === 'iframe' && /(^|\.)google\./i.test(location.hostname);
+            if (separate) {
+                // Open during the click so pop-up blockers allow it.
+                nw = window.open(googleHost ? location.origin + '/' : 'about:blank', '_blank');
+                if (!nw) {
+                    launchBusy = false;
+                    setCardLoading(name, false);
+                    showPopupBlocked(name, gd);
+                    return;
+                }
+                gameWindows.add(nw);
+                if (!googleHost) paintPopupLoading(nw, name);
+            }
+            try {
+                // No Form request or session round trip here.
+                var values = await Promise.all([fetchGame(gd), nw ? waitForPopup(nw, googleHost) : Promise.resolve()]);
+                var h = values[0];
+                if (disposed || accessBlocked || generation !== gameGeneration || nw && nw.closed) return;
+                var prev = achievements();
+                pushRecent(name);
+                renderRecent(false);
+                if (separate) {
+                    mountPopupGame(nw, name, gd, h);
+                    mounted = true;
+                } else {
+                    mountOverlayGame(name, h);
+                }
+                announceAchievements(prev);
+            } catch (e) {
+                if (!disposed && !accessBlocked) launchFailure(e, name, gd);
+            } finally {
+                launchBusy = false;
+                setCardLoading(name, false);
+                if (nw && !mounted) {
+                    gameWindows.delete(nw);
+                    try { nw.close(); } catch (_) { }
+                }
+            }
+        }
+
+        // type "write"  → the game HTML becomes the pop-out document.
+        // type "iframe" → the pop-out hosts the game in a full-window iframe.
+        function mountPopupGame(nw, name, gd, h) {
+            writeGameOpen = true;
+            var t0 = Date.now(), opener = window, recorded = false;
+            function recordPopupTime() {
+                if (recorded) return;
+                recorded = true;
+                try { addPlaytime(name, Date.now() - t0); } catch (_) { }
+                gameWindows.delete(nw);
+            }
+            var doc = nw.document;
+            if (gd.type === 'write') {
+                doc.open();
+                doc.write(h);
+                doc.title = name;
+                doc.close();
+            } else {
+                doc.title = name;
+                if (doc.body) doc.body.className = '';
+                doc.documentElement.style.cssText = 'margin:0;width:100%;height:100%;overflow:hidden;background:#000';
+                doc.body.textContent = '';
+                doc.body.style.cssText = 'margin:0;width:100%;height:100%;overflow:hidden;background:#000';
+                var gameFrame = doc.createElement('iframe');
+                gameFrame.style.cssText = 'position:fixed;inset:0;width:100%;height:100%;border:0;background:#000;opacity:1';
+                gameFrame.allow = 'autoplay; fullscreen; gamepad';
+                gameFrame.allowFullscreen = true;
+                gameFrame.onload = function () {
+                    setTimeout(function () { try { gameFrame.contentWindow.focus(); } catch (_) { } }, 100);
+                };
+                gameFrame.srcdoc = h;
+                doc.body.appendChild(gameFrame);
+            }
+            (function addClose() {
+                if (nw.closed) return;
+                try {
+                    if (!nw.document.body) { setTimeout(addClose, 50); return; }
+                    addPopupCloseButton(nw, function () {
+                        recordPopupTime();
+                        try { opener.focus(); } catch (_) { }
+                        nw.close();
+                    });
+                    nw.addEventListener('beforeunload', recordPopupTime);
+                } catch (_) { }
+            })();
+            // If the library tab closes, the pop-out closes too.
+            nw.setInterval(function () {
+                try { if (opener.closed) { recordPopupTime(); nw.close(); } } catch (_) { }
+            }, 5000);
+        }
+
+        function mountOverlayGame(name, h) {
+            saveCurrentTime();
+            curGame = name;
+            curStart = Date.now();
+            document.body.style.overflow = 'hidden';
+            overlay.style.display = 'flex';
+            setNowPlaying(name);
+            requestAnimationFrame(function () { overlay.classList.add('vis'); });
+            frame.classList.remove('ld');
+            frame.onload = function () {
+                frame.classList.add('ld');
+                setTimeout(function () { try { frame.contentWindow.focus(); } catch (_) { } }, 100);
+            };
+            frame.srcdoc = h;
+        }
+
+        /* ##########################################################################
+         * §10 LIBRARY STARTUP  (first render, heartbeat, focus/storage listeners)
+         * ########################################################################## */
+        renderFavorites(true);
+        renderRecent(true);
+        renderAll(true);
+        document.body.dataset.formsLibrary = '8';
+        window.__blFormsOpeningV8 = false;
+        auth.onProgress = null;
+        auth.startHeartbeat(failedAccess, acceptAccess);
+
+        focusHandler = function () {
+            if (document.visibilityState !== 'hidden' && Date.now() - lastVerified > TIMING.reverifyAfterMs) verifyAccess();
+        };
+        // Signing out (or into another account) in another tab closes this one.
+        storageHandler = function (e) {
+            if (e.key !== auth.sessionName) return;
+            var current = auth._saved();
+            if (!current || current.sessionToken !== sessionTokenAtOpen) {
+                returnToSignIn(Object.assign(new Error('This session was signed out or changed in another tab.'), { code: 'INVALID_SESSION' }));
+            }
+        };
+        window.addEventListener('focus', focusHandler);
+        window.addEventListener('storage', storageHandler);
+        expiryTimer = setInterval(function () {
+            if (!canLaunch()) return;
+            if (document.visibilityState !== 'hidden' && Date.now() - lastVerified > TIMING.offlineGraceMs && !accessCheck) verifyAccess();
+        }, 60000);
+
+        // Handle used when the bookmark is clicked again on this page.
+        window.__blLibraryV8 = {
+            theme: THEME.id,
+            refreshIfDue: function () {
+                if (Date.now() - lastVerified > TIMING.reverifyAfterMs) verifyAccess();
+            },
+            dispose: function () {
+                closeRunningGames();
+                disposeLibrary();
+            }
+        };
+
+        // A cached library is shown first; this background check then confirms it.
+        if (resumed) setTimeout(function () { verifyAccess(); }, 0);
+    }
+
+    /* ##########################################################################
+     * §11 BOOT  (what happens when the bookmark is clicked)
+     * ########################################################################## */
+    function start() {
+        try {
+            var cached = auth.resume();
+            if (cached) {
+                window.__blFormsOpeningV8 = false;
+                loadLibrary(cached.games, cached.username, Date.now(), true);
+                return;
+            }
+            var saved = auth._saved();
+            if (auth._validSession(saved)) {
+                // One-time migration for v6/v7 tokens that had no cached game list.
+                // This is a session check, not a login or password resubmission.
+                showRestoring();
+                auth.check(true).then(function (r) {
+                    hideRestoring();
+                    window.__blFormsOpeningV8 = false;
+                    loadLibrary(r.games, saved.username, Date.now(), false);
+                }).catch(function (e) {
+                    hideRestoring();
+                    showLogin(e);
+                });
+                return;
+            }
+            window.__blFormsOpeningV8 = false;
+            showLogin();
+        } catch (e) {
+            window.__blFormsOpeningV8 = false;
+            showLogin(e);
+        }
+    }
+
+    function boot() {
+        // 1. Library already open on this page.
+        var running = window.__blLibraryV8;
+        if (running && document.body && document.body.dataset.formsLibrary === '8') {
+            if (running.theme === THEME.id) {
+                running.refreshIfDue();
+                return;
+            }
+            // An older build (e.g. v8.1) is open: close it and reopen this one
+            // from the saved session (no password needed).
+            try { running.dispose(); } catch (_) { }
+        }
+        // 2. A v7 library from before the update is still open.
+        if (window.__blLibraryV7 && document.body && document.body.dataset.formsLibrary === '7') {
+            showNotice(COPY.notices.refreshTitle, COPY.notices.refreshMessage);
+            return;
+        }
+        // 3. Sign-in screen already showing.
+        var existing = document.getElementById(HOST_ID.login);
+        if (existing) {
+            if (existing.dataset.edition === THEME.id) {
+                try { existing.shadowRoot.getElementById('u').focus(); } catch (_) { }
+                return;
+            }
+            existing.remove();
+        }
+        // 4. Still opening from a click a moment ago.
+        if (window.__blFormsOpeningV8) return;
+        window.__blFormsOpeningV8 = true;
+        try {
+            auth = new window.BookmarkletFormsAuth(BACKEND);
+        } catch (e) {
+            window.__blFormsOpeningV8 = false;
+            var d = describeError(e);
+            showNotice(d.title, d.message);
+            return;
+        }
+        start();
+    }
+
+    boot();
+})().catch(function (e) {
+    window.__blFormsOpeningV8 = false;
+    alert('Game Library: ' + (e && e.message || e));
+});
