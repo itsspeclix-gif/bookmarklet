@@ -675,7 +675,7 @@
             recent: 'gameRecent_' + u,
             member: 'gameMember_' + u,
             appearance: THEME.prefKey + u,
-            effects: 'gameFx_' + u
+            sort: 'gameSort_' + u
         };
     }
     var TIME_DELTA_KEY = '_gameTimeDelta';   // playtime reported by instrumented games
@@ -736,8 +736,9 @@
      *    hero     : wg ws accessStatus accessText rCount sDate
      *    search   : sb sc noRes noResSub
      *    sections : favSec favGrid favCount recSec recGrid recCount allSec list allCount
+     *               sort buttons .sbtn[data-sort="az"|"played"|"default"]
      *    panel    : pOv pPanel phClose phAv phName phSub sg ptList pFavs pRecent pAch
-     *               buttons .tbtn[data-theme] (and optional .tbtn[data-fx])
+     *               buttons .tbtn[data-theme]
      *    game     : gOver closeBtn gFrame        footer: ftYr
      * ########################################################################## */
     var THEME = {
@@ -794,6 +795,9 @@
             empty: { playtime: 'No playtime yet.', favorites: 'No favorites yet.', recent: 'No games yet.' },
             recentIndex: function (i) { return '0' + (i + 1); },
             nowPlaying: function (name) { return 'Now Playing: ' + name; },
+            nowPlayingMany: function (n) { return 'Now Playing: ' + n + ' games'; },
+            switchToGame: 'Switch to the game window',
+            switchLabel: function (name) { return name + ' is open. Switch to it'; },
             popupTitle: function (name) { return 'Loading ' + name; },
             closeGame: 'Close game',
             avatarSaved: 'Avatar updated',
@@ -899,8 +903,11 @@ header{display:flex;justify-content:space-between;align-items:center;padding-bot
 .logo{font-family:var(--serif);font-style:italic;font-size:1.4rem;font-weight:400;letter-spacing:-.02em;cursor:default;}
 .logo b{font-weight:700;font-style:normal;color:var(--accent);}
 .nav-right{display:flex;align-items:center;gap:.75rem;min-width:0;}
-#npBadge{display:none;align-items:center;gap:.5rem;font-size:.65rem;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-dim);max-width:240px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+#npBadge{display:none;align-items:center;gap:.5rem;font-family:var(--mono);font-size:.65rem;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-dim);max-width:260px;white-space:nowrap;background:none;border:0;padding:.3rem 0;cursor:pointer;transition:color .15s;}
 #npBadge.on{display:flex;}
+#npBadge:hover,#npBadge:focus-visible{color:var(--accent);}
+#npTxt{overflow:hidden;text-overflow:ellipsis;}
+@media(max-width:600px){#npBadge{max-width:44vw;}}
 #npDot{width:7px;height:7px;background:var(--grn);border-radius:50%;flex-shrink:0;animation:npp 1.4s ease-in-out infinite;box-shadow:0 0 8px var(--grn);}
 @keyframes npp{0%,100%{opacity:1;}50%{opacity:.4;}}
 .umenu{position:relative;}
@@ -949,6 +956,8 @@ h1.greet em{font-style:italic;font-weight:500;color:var(--accent);}
 .sb-icon{position:absolute;left:1rem;top:50%;transform:translateY(-50%);color:var(--ink-dim);pointer-events:none;display:grid;place-items:center;}
 .sbar{width:100%;padding:.85rem 2.6rem .85rem 2.6rem;background:var(--bg);border:1px solid var(--line2);color:var(--ink);font-family:var(--mono);font-size:.9rem;outline:none;transition:border-color .15s;border-radius:0;}
 .sbar:focus{border-color:var(--accent);}
+.sbar{-webkit-appearance:none;appearance:none;}
+.sbar::-webkit-search-cancel-button,.sbar::-webkit-search-decoration{-webkit-appearance:none;display:none;}
 .sbar::placeholder{color:var(--ink-dim);opacity:.55;}
 .sclr{position:absolute;right:1rem;top:50%;transform:translateY(-50%);background:transparent;border:none;color:var(--ink-dim);cursor:pointer;padding:.25rem;display:none;align-items:center;justify-content:center;}
 .sclr:hover{color:var(--accent);}
@@ -960,6 +969,13 @@ h1.greet em{font-style:italic;font-weight:500;color:var(--accent);}
 #favSec,#recSec,#allSec{display:none;margin-bottom:3rem;}
 .slbl{font-size:.62rem;font-weight:600;text-transform:uppercase;color:var(--ink-dim);letter-spacing:.25em;margin-bottom:1.25rem;display:flex;justify-content:space-between;align-items:baseline;padding-bottom:.75rem;border-bottom:1px solid var(--line);}
 .slbl .scount{font-family:var(--mono);font-size:.62rem;color:var(--ink-dim);}
+.slbl-r{display:flex;align-items:center;gap:1rem;}
+.sortrow{display:inline-flex;border:1px solid var(--line2);}
+.sbtn{background:none;border:0;padding:.3rem .65rem;font-family:var(--mono);font-size:.58rem;font-weight:600;letter-spacing:.18em;text-transform:uppercase;color:var(--ink-dim);cursor:pointer;transition:background .15s,color .15s;}
+.sbtn+.sbtn{border-left:1px solid var(--line2);}
+.sbtn:hover{color:var(--accent);}
+.sbtn.active{background:var(--accent);color:var(--bg);}
+#allSec .slbl{align-items:center;flex-wrap:wrap;gap:.75rem;}
 #favGrid,#recGrid,#list{display:grid;grid-template-columns:repeat(auto-fill,minmax(170px,1fr));gap:0;border-top:1px solid var(--line);border-left:1px solid var(--line);}
 .card{background:transparent;border-right:1px solid var(--line);border-bottom:1px solid var(--line);padding:1.5rem 1rem;cursor:pointer;transition:background .2s,color .2s;display:flex;flex-direction:column;align-items:center;gap:.85rem;position:relative;opacity:0;animation:cIn .4s ease forwards;outline:none;}
 .card:hover,.card:focus-visible{background:var(--bg2);}
@@ -978,6 +994,8 @@ h1.greet em{font-style:italic;font-weight:500;color:var(--accent);}
 @keyframes spn{to{transform:rotate(360deg);}}
 .card.loading .cn::after{content:" \\2026";}
 .cn{font-family:var(--serif);font-weight:400;color:var(--ink);font-size:.95rem;text-align:center;line-height:1.3;letter-spacing:-.01em;transition:color .2s;overflow-wrap:anywhere;}
+.card.open::before{content:"Open";position:absolute;top:.75rem;left:.75rem;padding-left:11px;font-family:var(--mono);font-size:.55rem;font-weight:600;letter-spacing:.18em;text-transform:uppercase;color:var(--grn);background:radial-gradient(circle at 3px 50%,var(--grn) 3px,transparent 3.5px);}
+.card.open .ib{border-color:var(--grn);}
 .hrt{position:absolute;top:.6rem;right:.6rem;background:none;border:none;cursor:pointer;padding:.3rem;color:var(--ink-dim);opacity:.5;transition:.15s;display:grid;place-items:center;z-index:3;}
 .hrt:hover,.hrt:focus-visible{opacity:1;color:var(--red);}
 .hrt.on{opacity:1;color:var(--red);}
@@ -1141,7 +1159,7 @@ body.bl-popup{margin:0;min-height:100vh;display:grid;place-items:center;backgrou
             library: function (ctx) {
                 return '<div class="container">' +
                     '<header><div class="logo">Library<b>.</b></div><div class="nav-right">' +
-                    '<div id="npBadge" aria-live="polite"><div id="npDot"></div><span id="npTxt">Now Playing</span></div>' +
+                    '<button type="button" id="npBadge" aria-live="polite"><span id="npDot"></span><span id="npTxt">Now Playing</span></button>' +
                     '<div class="umenu"><button type="button" class="uinfo" id="toggleM" aria-haspopup="menu" aria-expanded="false"><span id="uName"></span><div id="pfpCircle"></div></button>' +
                     '<div class="dd" id="drp" role="menu">' +
                     '<button type="button" class="di" id="pdMi" role="menuitem">' + ICON.user + '<span>Profile</span></button>' +
@@ -1157,13 +1175,18 @@ body.bl-popup{margin:0;min-height:100vh;display:grid;place-items:center;backgrou
                     '<div class="ditem"><div class="dl">Resources</div><div class="dv" id="rCount"></div></div>' +
                     '<div class="ditem"><div class="dl">System Date</div><div class="dv" id="sDate"></div></div></section>' +
 
-                    '<section class="sw-block"><div class="sw-label"><span><span class="lmk">' + ICON.search + '</span> Search</span><span>Type to filter your library <kbd>/</kbd></span></div>' +
+                    '<section class="sw-block"><div class="sw-label"><span><span class="lmk">' + ICON.search + '</span> Search</span><span><kbd>/</kbd> to search &middot; <kbd>Enter</kbd> plays the first match</span></div>' +
                     '<div class="sw"><span class="sb-icon">' + ICON.search + '</span><input type="search" id="sb" class="sbar" placeholder="Search games..." autocomplete="off" spellcheck="false" aria-label="Search games">' +
                     '<button type="button" class="sclr" id="sc" aria-label="Clear search">' + ICON.x + '</button></div></section>' +
 
                     '<section id="favSec"><div class="slbl"><span><span class="lmk">' + ICON.heart + '</span> Favorites</span><span class="scount" id="favCount"></span></div><div id="favGrid"></div></section>' +
                     '<section id="recSec"><div class="slbl"><span><span class="lmk">' + ICON.clock + '</span> Recently Played</span><span class="scount" id="recCount"></span></div><div id="recGrid"></div></section>' +
-                    '<section id="allSec"><div class="slbl"><span><span class="lmk">' + ICON.controller + '</span> All Games</span><span class="scount" id="allCount"></span></div><div id="list"></div></section>' +
+                    '<section id="allSec"><div class="slbl"><span><span class="lmk">' + ICON.controller + '</span> All Games</span>' +
+                    '<span class="slbl-r"><span class="sortrow" role="group" aria-label="Sort games">' +
+                    '<button type="button" class="sbtn" data-sort="az">A\u2013Z</button>' +
+                    '<button type="button" class="sbtn" data-sort="played">Most played</button>' +
+                    '<button type="button" class="sbtn" data-sort="default">Default</button></span>' +
+                    '<span class="scount" id="allCount"></span></span></div><div id="list"></div></section>' +
                     '<div id="noRes"><div class="nr-title">Nothing found.</div><div class="nr-sub" id="noResSub">Try a different query.</div></div>' +
                     '<footer><div>GAME LIBRARY &middot; PERSONAL</div><div id="ftYr"></div></footer></div>' +
 
@@ -1625,7 +1648,7 @@ body.bl-popup{margin:0;min-height:100vh;display:grid;place-items:center;backgrou
         }
         setAccessState('online');
 
-        /* Appearance (theme variants) and the optional effects switch. */
+        /* Appearance (Dark / Light). */
         function applyAppearance(id) {
             var ids = THEME.appearances.map(function (a) { return a.id; });
             if (ids.indexOf(id) < 0) id = ids[0];
@@ -1637,22 +1660,9 @@ body.bl-popup{margin:0;min-height:100vh;display:grid;place-items:center;backgrou
                 b.setAttribute('aria-pressed', String(on));
             });
         }
-        function applyEffects(on) {
-            document.body.classList.toggle('fx-off', !on);
-            try { localStorage.setItem(K.effects, on ? 'on' : 'off'); } catch (_) { }
-            document.querySelectorAll('.tbtn[data-fx]').forEach(function (b) {
-                var active = (b.dataset.fx === 'on') === on;
-                b.classList.toggle('active', active);
-                b.setAttribute('aria-pressed', String(active));
-            });
-        }
         applyAppearance(localStorage.getItem(K.appearance) || THEME.appearances[0].id);
-        applyEffects(localStorage.getItem(K.effects) !== 'off');
         document.querySelectorAll('.tbtn[data-theme]').forEach(function (b) {
             b.onclick = function () { applyAppearance(b.dataset.theme); };
-        });
-        document.querySelectorAll('.tbtn[data-fx]').forEach(function (b) {
-            b.onclick = function () { applyEffects(b.dataset.fx === 'on'); };
         });
 
         /* Avatar: stored as a ≤256 px JPEG data URL. */
@@ -1758,11 +1768,36 @@ body.bl-popup{margin:0;min-height:100vh;display:grid;place-items:center;backgrou
         byId('pOv').onclick = closePanel;
         byId('phAv').onclick = function () { byId('pfpInp').click(); };
 
-        /* ---- 7d. Game grid: cards, sections, search ----------------------------- */
+        /* ---- 7d. Game grid: cards, sections, sorting, search -------------------- */
+
+        /* Search ignores case, spaces, punctuation and accents, and accepts
+         * several partial words in any order ("geo dash", "paperio") or the
+         * initials of a title ("gdl" → Geometry Dash Lite). */
+        function searchKey(s) {
+            return String(s).toLowerCase().normalize('NFKD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9]+/g, '');
+        }
+        function initials(s) {
+            return String(s).toLowerCase().normalize('NFKD').split(/[^a-z0-9]+/).filter(Boolean)
+                .map(function (w) { return w.charAt(0); }).join('');
+        }
+        function matchesQuery(name, query) {
+            var words = query.split(/\s+/).map(searchKey).filter(Boolean);
+            if (!words.length) return true;
+            var key = searchKey(name);
+            if (words.every(function (w) { return key.indexOf(w) > -1; })) return true;
+            return words.length === 1 && words[0].length >= 2 && initials(name).indexOf(words[0]) === 0;
+        }
+
         var sbEl = byId('sb'), scEl = byId('sc');
         sbEl.oninput = function () {
             scEl.classList.toggle('on', sbEl.value.length > 0);
             doFilter();
+        };
+        // Enter in the search box plays the first visible match.
+        sbEl.onkeydown = function (e) {
+            if (e.key !== 'Enter' || !sbEl.value.trim()) return;
+            var first = Array.prototype.find.call(document.querySelectorAll('#list .card'), function (c) { return c.style.display !== 'none'; });
+            if (first) { e.preventDefault(); launchGame(first.dataset.name, games[first.dataset.name]); }
         };
         scEl.onclick = function () {
             sbEl.value = '';
@@ -1771,17 +1806,17 @@ body.bl-popup{margin:0;min-height:100vh;display:grid;place-items:center;backgrou
             sbEl.focus();
         };
         function doFilter() {
-            var q = sbEl.value.trim().toLowerCase(), visible = 0;
+            var q = sbEl.value.trim(), visible = 0;
             document.body.classList.toggle('searching', q.length > 0);
             document.querySelectorAll('#list .card').forEach(function (c) {
-                var show = c.dataset.name.toLowerCase().indexOf(q) > -1;
+                var show = matchesQuery(c.dataset.name, q);
                 c.style.display = show ? '' : 'none';
                 if (show) visible++;
             });
             byId('allCount').textContent = q ? COPY.count(visible) + ' / ' + COPY.count(gCount) : COPY.count(gCount);
             var none = visible === 0 && q.length > 0;
             byId('noRes').style.display = none ? 'block' : 'none';
-            if (none) byId('noResSub').textContent = COPY.noResultsSub(sbEl.value.trim());
+            if (none) byId('noResSub').textContent = COPY.noResultsSub(q);
         }
 
         // Keyboard: "/" focuses search, Escape closes the panel/menu or clears search.
@@ -1854,6 +1889,7 @@ body.bl-popup{margin:0;min-height:100vh;display:grid;place-items:center;backgrou
             grid.innerHTML = '';
             fv.forEach(function (n, i) { makeCard(n, games[n], grid, false, i, animate); });
             byId('favCount').textContent = COPY.count(fv.length);
+            paintRunning();
         }
         function renderRecent(animate) {
             var rc = getRecent().filter(function (n) { return !!games[n]; }).slice(0, 6);
@@ -1863,13 +1899,49 @@ body.bl-popup{margin:0;min-height:100vh;display:grid;place-items:center;backgrou
             grid.innerHTML = '';
             rc.forEach(function (n, i) { makeCard(n, games[n], grid, false, i, animate); });
             byId('recCount').textContent = COPY.count(rc.length);
+            paintRunning();
         }
+        /* "All games" order: A–Z, most played, or the order the catalog arrives in.
+         * (Number-only titles such as "2048" always come first in that last one:
+         *  JavaScript orders integer-like object keys before the rest.) */
+        var SORT_MODES = ['az', 'played', 'default'];
+        var sortMode = SORT_MODES.indexOf(localStorage.getItem(K.sort)) > -1 ? localStorage.getItem(K.sort) : 'az';
+        function byTitle(a, b) { return a.localeCompare(b, undefined, { numeric: true, sensitivity: 'base' }); }
+        function sortedNames() {
+            var names = Object.keys(games);
+            if (sortMode === 'az') return names.sort(byTitle);
+            if (sortMode === 'played') {
+                var st = getStats();
+                return names.sort(function (a, b) { return (st[b] || 0) - (st[a] || 0) || byTitle(a, b); });
+            }
+            return names;
+        }
+        function paintSortButtons() {
+            document.querySelectorAll('.sbtn[data-sort]').forEach(function (b) {
+                var on = b.dataset.sort === sortMode;
+                b.classList.toggle('active', on);
+                b.setAttribute('aria-pressed', String(on));
+            });
+        }
+        function applySort(mode) {
+            sortMode = mode;
+            try { localStorage.setItem(K.sort, mode); } catch (_) { }
+            paintSortButtons();
+            renderAll(false);
+            doFilter();
+        }
+        document.querySelectorAll('.sbtn[data-sort]').forEach(function (b) {
+            b.onclick = function () { applySort(b.dataset.sort); };
+        });
+        paintSortButtons();
+
         function renderAll(animate) {
             var list = byId('list');
             byId('allSec').style.display = 'block';
             list.innerHTML = '';
-            Object.keys(games).forEach(function (name, i) { makeCard(name, games[name], list, true, i, animate); });
+            sortedNames().forEach(function (name, i) { makeCard(name, games[name], list, true, i, animate); });
             byId('allCount').textContent = COPY.count(gCount);
+            paintRunning();
         }
         function setCardLoading(name, on) {
             document.querySelectorAll('.card').forEach(function (c) {
@@ -1880,16 +1952,62 @@ body.bl-popup{margin:0;min-height:100vh;display:grid;place-items:center;backgrou
             });
         }
 
-        /* In-page game overlay. */
+        /* Running games and playtime.
+         *   curGame / curStart  the game in the in-page overlay
+         *   popups              pop-out windows → { name, since }
+         * Playtime is saved every 30 s while a game runs, and again when it
+         * closes, so a crash or a closed tab loses at most a few seconds. */
         var overlay = byId('gOver'), frame = byId('gFrame');
-        var curGame = null, curStart = null, writeGameOpen = false;
+        var curGame = null, curStart = null;
+        var popups = new Map();
+        var SAVE_EVERY_MS = 30 * 1000;
+
         function saveCurrentTime() {
             if (curGame && curStart) {
                 addPlaytime(curGame, Date.now() - curStart);
                 curStart = null;
             }
         }
-        window.addEventListener('beforeunload', saveCurrentTime);
+        function flushPopup(win, final) {
+            var p = popups.get(win);
+            if (!p) return;
+            var now = Date.now(), prev = final ? achievements() : null;
+            addPlaytime(p.name, now - p.since);
+            p.since = now;
+            if (final) {
+                popups.delete(win);
+                gameWindows.delete(win);
+                paintRunning();
+                announceAchievements(prev);
+            }
+        }
+        function popupFor(name) {
+            var found = null;
+            popups.forEach(function (p, w) {
+                var closed = true;
+                try { closed = w.closed; } catch (_) { }
+                if (p.name === name && !closed) found = w;
+            });
+            return found;
+        }
+        function saveAllPlaytime() {
+            saveCurrentTime();
+            popups.forEach(function (p, w) { flushPopup(w, false); });
+        }
+        window.addEventListener('beforeunload', saveAllPlaytime);
+        var playTimer = setInterval(function () {
+            var now = Date.now();
+            popups.forEach(function (p, w) {
+                var closed = true;
+                try { closed = w.closed; } catch (_) { }
+                if (closed) flushPopup(w, true);
+                else if (now - p.since >= SAVE_EVERY_MS) flushPopup(w, false);
+            });
+            if (curGame && curStart && now - curStart >= SAVE_EVERY_MS) {
+                addPlaytime(curGame, now - curStart);
+                curStart = now;
+            }
+        }, 1000);
         function consumeTimeDelta() {
             var d = readJSON(TIME_DELTA_KEY, null);
             if (d && d.name && d.ms) {
@@ -1900,19 +2018,36 @@ body.bl-popup{margin:0;min-height:100vh;display:grid;place-items:center;backgrou
             }
         }
         var deltaTimer = setInterval(consumeTimeDelta, 2000);
-        function setNowPlaying(name) {
+        /* "Now playing" badge + "open" marker on cards for every running game.
+         * Clicking the badge (or an open game's card) switches to its window. */
+        function paintRunning() {
+            var names = curGame ? [curGame] : [];
+            popups.forEach(function (p) { names.push(p.name); });
             var badge = byId('npBadge'), txt = byId('npTxt');
-            if (badge) badge.classList.toggle('on', !!name);
-            if (txt && name) txt.textContent = COPY.nowPlaying(name);
-            document.body.classList.toggle('playing', !!name);
+            if (badge) {
+                badge.classList.toggle('on', names.length > 0);
+                badge.title = popups.size ? COPY.switchToGame : '';
+            }
+            if (txt && names.length) txt.textContent = names.length === 1 ? COPY.nowPlaying(names[0]) : COPY.nowPlayingMany(names.length);
+            document.body.classList.toggle('playing', !!curGame);
+            document.querySelectorAll('.card').forEach(function (c) {
+                var open = names.indexOf(c.dataset.name) > -1;
+                c.classList.toggle('open', open);
+                c.setAttribute('aria-label', open ? COPY.switchLabel(c.dataset.name) : COPY.playLabel(c.dataset.name));
+            });
         }
+        byId('npBadge').onclick = function () {
+            var last = null;
+            popups.forEach(function (p, w) { last = w; });
+            if (last) { try { last.focus(); } catch (_) { } }
+        };
         byId('closeBtn').onclick = function () {
             var prev = achievements();
             saveCurrentTime();
             curGame = null;
             announceAchievements(prev);
             overlay.classList.remove('vis');
-            setNowPlaying(null);
+            paintRunning();
             var closeGeneration = ++gameGeneration;
             setTimeout(function () {
                 if (closeGeneration !== gameGeneration) return;
@@ -1942,7 +2077,8 @@ body.bl-popup{margin:0;min-height:100vh;display:grid;place-items:center;backgrou
             gameGeneration++;
             saveCurrentTime();
             curGame = null;
-            writeGameOpen = false;
+            popups.forEach(function (p) { addPlaytime(p.name, Date.now() - p.since); });
+            popups.clear();
             gameControllers.forEach(function (c) { c.abort(); });
             gameControllers.clear();
             if (frame) {
@@ -1954,7 +2090,7 @@ body.bl-popup{margin:0;min-height:100vh;display:grid;place-items:center;backgrou
                 overlay.style.display = 'none';
             }
             document.body.style.overflow = 'auto';
-            setNowPlaying(null);
+            paintRunning();
             gameWindows.forEach(function (w) {
                 try { if (!w.closed) w.close(); } catch (_) { }
             });
@@ -1987,8 +2123,9 @@ body.bl-popup{margin:0;min-height:100vh;display:grid;place-items:center;backgrou
             auth.stopHeartbeat();
             auth.cancelPendingRequests();
             clearInterval(deltaTimer);
+            clearInterval(playTimer);
             clearInterval(expiryTimer);
-            window.removeEventListener('beforeunload', saveCurrentTime);
+            window.removeEventListener('beforeunload', saveAllPlaytime);
             if (focusHandler) window.removeEventListener('focus', focusHandler);
             if (storageHandler) window.removeEventListener('storage', storageHandler);
             if (window.__blLibraryV8) window.__blLibraryV8 = null;
@@ -2196,6 +2333,9 @@ body.bl-popup{margin:0;min-height:100vh;display:grid;place-items:center;backgrou
         }
 
         async function launchGame(name, gd) {
+            // Already open in its own window: switch to it instead of opening another.
+            var running = popupFor(name);
+            if (running) { try { running.focus(); } catch (_) { } return; }
             if (launchBusy || !canLaunch()) return;
             launchBusy = true;
             setCardLoading(name, true);
@@ -2244,14 +2384,10 @@ body.bl-popup{margin:0;min-height:100vh;display:grid;place-items:center;backgrou
         // type "write"  → the game HTML becomes the pop-out document.
         // type "iframe" → the pop-out hosts the game in a full-window iframe.
         function mountPopupGame(nw, name, gd, h) {
-            writeGameOpen = true;
-            var t0 = Date.now(), opener = window, recorded = false;
-            function recordPopupTime() {
-                if (recorded) return;
-                recorded = true;
-                try { addPlaytime(name, Date.now() - t0); } catch (_) { }
-                gameWindows.delete(nw);
-            }
+            var opener = window;
+            function finish() { try { flushPopup(nw, true); } catch (_) { } }
+            popups.set(nw, { name: name, since: Date.now() });
+            paintRunning();
             var doc = nw.document;
             if (gd.type === 'write') {
                 doc.open();
@@ -2279,16 +2415,17 @@ body.bl-popup{margin:0;min-height:100vh;display:grid;place-items:center;backgrou
                 try {
                     if (!nw.document.body) { setTimeout(addClose, 50); return; }
                     addPopupCloseButton(nw, function () {
-                        recordPopupTime();
+                        finish();
                         try { opener.focus(); } catch (_) { }
                         nw.close();
                     });
-                    nw.addEventListener('beforeunload', recordPopupTime);
+                    nw.addEventListener('beforeunload', finish);
                 } catch (_) { }
             })();
-            // If the library tab closes, the pop-out closes too.
+            // If the library tab closes, the pop-out closes too (its playtime was
+            // already saved by the library's beforeunload handler).
             nw.setInterval(function () {
-                try { if (opener.closed) { recordPopupTime(); nw.close(); } } catch (_) { }
+                try { if (opener.closed) nw.close(); } catch (_) { }
             }, 5000);
         }
 
@@ -2298,7 +2435,7 @@ body.bl-popup{margin:0;min-height:100vh;display:grid;place-items:center;backgrou
             curStart = Date.now();
             document.body.style.overflow = 'hidden';
             overlay.style.display = 'flex';
-            setNowPlaying(name);
+            paintRunning();
             requestAnimationFrame(function () { overlay.classList.add('vis'); });
             frame.classList.remove('ld');
             frame.onload = function () {
